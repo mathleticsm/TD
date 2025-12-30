@@ -23,7 +23,6 @@ ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
 # Avoid Render Free /tmp 2GB temp limit
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "/app/storage")
 TD_TEMP_DIR = os.environ.get("TD_TEMP_DIR", "/app/tdtmp")
-
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 os.makedirs(TD_TEMP_DIR, exist_ok=True)
 os.environ.setdefault("TMPDIR", TD_TEMP_DIR)
@@ -128,7 +127,7 @@ def add_job(job: Dict[str, Any]) -> None:
 def get_job_or_404(job_id: str) -> Dict[str, Any]:
     job = jobs.get(job_id)
     if not job:
-        raise HTTPException(404, "job not found")
+        raise HTTPException(404, "job not found (server restarted / memory cleared)")
     return job
 
 
@@ -145,11 +144,11 @@ def hint_from_log(log: str) -> str:
     if not log:
         return ""
     if "Couldn't find a valid ICU package installed" in log or "dotnet-missing-libicu" in log:
-        return "Missing ICU. Install `libicu-dev` in Dockerfile and redeploy."
+        return "Missing ICU. Install `libicu` (or `libicu-dev`) in Dockerfile and redeploy."
     if "temporary storage volume /tmp exceeded" in log.lower():
-        return (
-            "Hit Render /tmp 2GB cap. Keep storage/temp OUT of /tmp, and use 1-hour chunks for 1080p."
-        )
+        return "Hit Render /tmp 2GB cap. Keep temp/downloads OUT of /tmp and use 1-hour chunks for 1080p."
+    if ".gz is not a valid chat file extension" in log:
+        return "Fix: chatdownload output must end in .json (not .json.gz)."
     if "Quality not found" in log or "Unable to find requested quality" in log:
         return "Quality unavailable. Try 1080p (not 1080p60) or Auto."
     if "429" in log or "Too Many Requests" in log:
@@ -254,15 +253,18 @@ def td_chatdownload(
     beginning: Optional[str],
     ending: Optional[str],
 ) -> List[str]:
+    # IMPORTANT: output must be .json (NOT .json.gz) or CLI throws NotSupportedException.
     cmd = [
         "TwitchDownloaderCLI", "chatdownload",
         "--id", vod_id,
         "-o", out_path,
-        "--compression", "Gzip",
         "-E",
         "--threads", str(threads),
         "--temp-path", TD_TEMP_DIR,
     ]
+    # Some versions support compression, but .gz filename is still invalid:
+    # cmd += ["--compression", "Gzip"]
+
     if beginning:
         cmd += ["--beginning", beginning]
     if ending:
@@ -307,6 +309,7 @@ def ffmpeg_side_by_side(
     height: int,
     crf: int,
 ) -> List[str]:
+    # Final video is side-by-side. Video scaled to 1920xheight, chat scaled to chat_width x height.
     filter_complex = (
         f"[0:v]scale=1920:{height}:force_original_aspect_ratio=decrease,"
         f"pad=1920:{height}:(ow-iw)/2:(oh-ih)/2[vid];"
@@ -463,7 +466,7 @@ def system(req: Request):
 
 @app.get("/", response_class=HTMLResponse)
 def home():
-    # NOT an f-string. We'll replace placeholders safely.
+    # IMPORTANT: NOT an f-string. Avoids Python trying to interpolate JS template braces.
     html = """<!doctype html>
 <html lang="en">
 <head>
@@ -819,16 +822,26 @@ def home():
   }
   function clearMsg(){ document.getElementById("msgArea").innerHTML = ""; }
 
-  // ========= Safe JSON read (fixes "Unexpected end of JSON input") =========
+  // ========= Safe JSON read =========
   async function readJsonSafe(res){
     const text = await res.text();
-    if (!text) throw new Error("Empty response (" + res.status + ") - instance may have restarted/slept");
+    if (!text){
+      const err = new Error("Empty response (" + res.status + ") - instance may have restarted/slept");
+      err.status = res.status;
+      throw err;
+    }
     let data;
     try { data = JSON.parse(text); }
-    catch { throw new Error("Invalid JSON (" + res.status + "): " + text.slice(0,140)); }
+    catch {
+      const err = new Error("Invalid JSON (" + res.status + "): " + text.slice(0,140));
+      err.status = res.status;
+      throw err;
+    }
     if (!res.ok){
       const msg = (data && (data.detail || data.error)) ? (data.detail || data.error) : text;
-      throw new Error(msg);
+      const err = new Error(msg);
+      err.status = res.status;
+      throw err;
     }
     return data;
   }
@@ -893,6 +906,8 @@ def home():
   // ========= Jobs =========
   let selectedJobId = null;
   let pollTimer = null;
+  let serviceOnline = false;
+  let sysBackoffMs = 2000;
 
   function badgeForStatus(st){
     if (st==="done") return "badge good";
@@ -934,18 +949,21 @@ def home():
 
   window.selectJob = async function(jobId, silent=false){
     selectedJobId = jobId;
-    if (!silent) clearMsg();
-
-    document.getElementById("btnDownload").disabled = true;
-    document.getElementById("btnDelete").disabled = true;
-    document.getElementById("btnCancel").disabled = true;
-
-    const r = await api("/api/jobs/" + jobId);
-    const job = await readJsonSafe(r);
-
-    updateDetail(job);
-    await refreshJobs();
-    startPollingIfNeeded(job);
+    try{
+      const job = await readJsonSafe(await api("/api/jobs/" + jobId));
+      updateDetail(job);
+      await refreshJobs();
+      startPollingIfNeeded(job);
+    }catch(e){
+      if (e.status === 404){
+        selectedJobId = null;
+        if (pollTimer){ clearInterval(pollTimer); pollTimer = null; }
+        document.getElementById("logBox").textContent = "Job not found (server restarted). Refreshing…";
+        await refreshJobs();
+        return;
+      }
+      if (!silent) showMsg(escapeHtml(e.message), "err");
+    }
   }
 
   function updateDetail(job){
@@ -979,8 +997,7 @@ def home():
     if (job.status === "running" || job.status === "queued"){
       pollTimer = setInterval(async () => {
         try{
-          const r = await api("/api/jobs/" + selectedJobId);
-          const j = await readJsonSafe(r);
+          const j = await readJsonSafe(await api("/api/jobs/" + selectedJobId));
           updateDetail(j);
           await refreshJobs();
           if (j.status !== "running" && j.status !== "queued"){
@@ -988,7 +1005,7 @@ def home():
             pollTimer = null;
           }
         }catch(e){
-          // ignore transient (sleep/restart)
+          // ignore transient
         }
       }, 2500);
     }
@@ -1019,12 +1036,11 @@ def home():
 
     try{
       setStatus("warn","Queueing…","Creating job…");
-      const r = await api("/api/jobs", {
+      const data = await readJsonSafe(await api("/api/jobs", {
         method: "POST",
         headers: {"Content-Type":"application/json"},
         body: JSON.stringify(payload)
-      });
-      const data = await readJsonSafe(r);
+      }));
       showMsg("Job created: <span class='mono'>" + data.job_id + "</span>", "ok");
       await refreshJobs();
       await selectJob(data.job_id);
@@ -1100,7 +1116,6 @@ def home():
     if (!selectedJobId) return;
     try{
       const j = await readJsonSafe(await api("/api/jobs/" + selectedJobId));
-      // update without re-fetching list
       const filter = document.getElementById("logFilter").value.trim().toLowerCase();
       const lines = (j.log || "").split("\\n");
       const filtered = filter ? lines.filter(x => x.toLowerCase().includes(filter)) : lines;
@@ -1111,56 +1126,53 @@ def home():
   // ========= Health + System =========
   async function wakePing(){
     try{
-      const r = await fetch("/healthz");
+      const r = await fetch("/healthz", { cache: "no-store" });
       if (!r.ok) throw new Error();
+      serviceOnline = true;
+      sysBackoffMs = 2000;
       document.getElementById("wakeDot").className = "dot good";
       document.getElementById("wakeText").textContent = "Online";
     }catch(e){
+      serviceOnline = false;
       document.getElementById("wakeDot").className = "dot warn";
       document.getElementById("wakeText").textContent = "Warming up…";
     }
   }
+  setInterval(wakePing, 60000);
+  wakePing();
 
   async function sysPing(){
-    const dot = document.getElementById("sysDot");
-    const diskText = document.getElementById("diskText");
-    const queueText = document.getElementById("queueText");
+    if (!serviceOnline) return;
+    if (!getToken()) return;
+
     try{
-      if (!getToken()){
-        dot.className = "dot warn";
-        diskText.textContent = "— (set token)";
-        queueText.textContent = "—";
-        return;
-      }
       const s = await readJsonSafe(await api("/api/system"));
       const free = (s.disk_download_dir && s.disk_download_dir.free_mb) ? s.disk_download_dir.free_mb : 0;
       const total = (s.disk_download_dir && s.disk_download_dir.total_mb) ? s.disk_download_dir.total_mb : 0;
-      diskText.textContent = free + "MB / " + total + "MB";
+      document.getElementById("diskText").textContent = free + "MB / " + total + "MB";
+
       const qsz = (s.queue && s.queue.size) ? s.queue.size : 0;
       const qmax = (s.queue && s.queue.max) ? s.queue.max : 0;
-      queueText.textContent = qsz + " / " + qmax;
+      document.getElementById("queueText").textContent = qsz + " / " + qmax;
 
+      const dot = document.getElementById("sysDot");
       if (free < 500) dot.className = "dot bad";
       else if (free < 900) dot.className = "dot warn";
       else dot.className = "dot good";
+
+      sysBackoffMs = 2000;
     }catch(e){
-      dot.className = "dot warn";
-      diskText.textContent = "—";
-      queueText.textContent = "—";
+      sysBackoffMs = Math.min(30000, Math.floor(sysBackoffMs * 1.6));
+    }finally{
+      setTimeout(sysPing, sysBackoffMs);
     }
   }
+  setTimeout(sysPing, 2000);
 
   // Init
   updateTokenBadge();
   setStatus("", "Idle", "Ready.");
-  wakePing(); setInterval(wakePing, 60000);
-  sysPing(); setInterval(sysPing, 20000);
-
-  (async () => {
-    try{
-      if (getToken()) await refreshJobs();
-    }catch(e){}
-  })();
+  (async () => { try{ if(getToken()) await refreshJobs(); }catch(e){} })();
 </script>
 </body>
 </html>
@@ -1251,7 +1263,8 @@ async def create_job(req: Request):
     job_id = uuid.uuid4().hex
 
     video_path = os.path.join(DOWNLOAD_DIR, f"{vod_id}-{job_id}.video.mp4")
-    chat_json = os.path.join(DOWNLOAD_DIR, f"{vod_id}-{job_id}.chat.json.gz")
+    # IMPORTANT FIX: chat file MUST be .json (NOT .json.gz)
+    chat_json = os.path.join(DOWNLOAD_DIR, f"{vod_id}-{job_id}.chat.json")
     chat_mp4 = os.path.join(DOWNLOAD_DIR, f"{vod_id}-{job_id}.chat.mp4")
     final_path = os.path.join(DOWNLOAD_DIR, f"{vod_id}-{job_id}.final.mp4")
 
