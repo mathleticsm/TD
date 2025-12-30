@@ -7,6 +7,9 @@ import signal
 import shutil
 import threading
 import subprocess
+import hmac
+import hashlib
+import base64
 from queue import Queue, Empty
 from typing import Optional, Dict, Any, List
 
@@ -19,6 +22,10 @@ app = FastAPI()
 # Config (Render-friendly)
 # =========================
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
+
+# Public download link signing (so downloads work without custom headers)
+DOWNLOAD_SECRET = os.environ.get("DOWNLOAD_SECRET", "")  # MUST set in Render env
+DOWNLOAD_TOKEN_TTL = int(os.environ.get("DOWNLOAD_TOKEN_TTL", "3600"))  # seconds
 
 # Avoid Render Free /tmp 2GB temp limit
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "/app/storage")
@@ -221,6 +228,42 @@ def run_and_log(job: Dict[str, Any], cmd: List[str], stage: str) -> None:
 
 
 # =========================
+# Signed public download links
+# =========================
+def _b64url(b: bytes) -> str:
+    return base64.urlsafe_b64encode(b).decode("utf-8").rstrip("=")
+
+
+def _sign_download(job_id: str, expires: int) -> str:
+    if not DOWNLOAD_SECRET:
+        raise RuntimeError("DOWNLOAD_SECRET not set")
+    msg = f"{job_id}:{expires}".encode("utf-8")
+    sig = hmac.new(DOWNLOAD_SECRET.encode("utf-8"), msg, hashlib.sha256).digest()
+    return _b64url(sig)
+
+
+def make_download_token(job_id: str) -> str:
+    exp = now_ts() + DOWNLOAD_TOKEN_TTL
+    sig = _sign_download(job_id, exp)
+    return f"{exp}.{sig}"
+
+
+def verify_download_token(job_id: str, token: str) -> bool:
+    try:
+        exp_s, sig = token.split(".", 1)
+        exp = int(exp_s)
+    except Exception:
+        return False
+    if exp < now_ts():
+        return False
+    try:
+        expected = _sign_download(job_id, exp)
+    except Exception:
+        return False
+    return hmac.compare_digest(expected, sig)
+
+
+# =========================
 # TwitchDownloaderCLI builders
 # =========================
 def td_videodownload(
@@ -262,7 +305,7 @@ def td_chatdownload(
         "--threads", str(threads),
         "--temp-path", TD_TEMP_DIR,
     ]
-    # Some versions support compression, but .gz filename is still invalid:
+    # If your CLI supports compression reliably with .json outputs, you can enable:
     # cmd += ["--compression", "Gzip"]
 
     if beginning:
@@ -309,7 +352,6 @@ def ffmpeg_side_by_side(
     height: int,
     crf: int,
 ) -> List[str]:
-    # Final video is side-by-side. Video scaled to 1920xheight, chat scaled to chat_width x height.
     filter_complex = (
         f"[0:v]scale=1920:{height}:force_original_aspect_ratio=decrease,"
         f"pad=1920:{height}:(ow-iw)/2:(oh-ih)/2[vid];"
@@ -426,6 +468,15 @@ def worker_loop():
             job["stage"] = "done"
             job["path"] = payload["final_path"]
 
+            # Create a public download URL that works without custom headers
+            if DOWNLOAD_SECRET:
+                tok = make_download_token(job_id)
+                job["download_token"] = tok
+                job["download_url"] = f"/dl/{job_id}?t={tok}"
+            else:
+                job["download_token"] = ""
+                job["download_url"] = ""
+
         except Exception as e:
             job["status"] = "error"
             job["stage"] = "failed"
@@ -461,12 +512,30 @@ def system(req: Request):
         "queue": {"size": q.qsize(), "max": MAX_QUEUE},
         "jobs_in_memory": len(jobs_order),
         "time": now_ts(),
+        "download_tokens_enabled": bool(DOWNLOAD_SECRET),
     }
+
+
+@app.get("/dl/{job_id}")
+def public_download(job_id: str, t: str):
+    job = get_job_or_404(job_id)
+    if job.get("status") != "done":
+        raise HTTPException(409, "not ready")
+
+    if not DOWNLOAD_SECRET:
+        raise HTTPException(500, "DOWNLOAD_SECRET not configured")
+
+    if not t or not verify_download_token(job_id, t):
+        raise HTTPException(401, "invalid or expired download token")
+
+    path = job.get("path") or ""
+    if not path or not os.path.exists(path):
+        raise HTTPException(410, "file expired or missing")
+    return FileResponse(path, filename=os.path.basename(path))
 
 
 @app.get("/", response_class=HTMLResponse)
 def home():
-    # IMPORTANT: NOT an f-string. Avoids Python trying to interpolate JS template braces.
     html = """<!doctype html>
 <html lang="en">
 <head>
@@ -557,6 +626,7 @@ def home():
     .actions>button{flex:1;min-width:220px}
     .tiny{font-size:11.5px;color:rgba(234,240,255,.55)}
     .hr{height:1px;background:rgba(255,255,255,.10);margin:12px 0}
+    .smallNote{margin-top:10px;color:rgba(234,240,255,.55);font-size:11.5px;line-height:1.45}
   </style>
 </head>
 <body>
@@ -567,6 +637,9 @@ def home():
       <div class="sub">
         1080p video + optional chat render. On Free, prefer <b>1-hour chunks</b>.<br/>
         Storage: <span class="mono">__DOWNLOAD_DIR__</span> • Temp: <span class="mono">__TD_TEMP_DIR__</span>
+      </div>
+      <div class="smallNote">
+        Downloads require <b>DOWNLOAD_SECRET</b> set in Render env (for public signed links).
       </div>
     </div>
     <div class="chips">
@@ -784,7 +857,6 @@ def home():
 </div>
 
 <script>
-  // ========= Token =========
   const TOKEN_KEY = "td_admin_token";
   function getToken(){ return localStorage.getItem(TOKEN_KEY) || ""; }
   function setToken(t){ localStorage.setItem(TOKEN_KEY, t); updateTokenBadge(); }
@@ -806,7 +878,6 @@ def home():
     setToken(trimmed);
   };
 
-  // ========= UI =========
   function setStatus(kind, title, sub){
     const dot = document.getElementById("statusDot");
     dot.className = "dot " + (kind || "");
@@ -822,7 +893,6 @@ def home():
   }
   function clearMsg(){ document.getElementById("msgArea").innerHTML = ""; }
 
-  // ========= Safe JSON read =========
   async function readJsonSafe(res){
     const text = await res.text();
     if (!text){
@@ -867,7 +937,6 @@ def home():
     return (h>0 ? (h+":"+mm+":"+rr) : (m+":"+rr));
   }
 
-  // ========= Chunk helpers =========
   function toSeconds(hms){
     const parts = hms.split(":").map(x => parseInt(x,10));
     if (parts.length !== 3) return 0;
@@ -895,7 +964,6 @@ def home():
     document.getElementById("end").value = fromSeconds(toSeconds(e) + mins*60);
   };
 
-  // ========= Chat toggle =========
   const includeChatEl = document.getElementById("include_chat");
   function syncChatSettings(){
     document.getElementById("chatSettings").style.display = includeChatEl.checked ? "block" : "none";
@@ -903,7 +971,6 @@ def home():
   includeChatEl.onchange = syncChatSettings;
   syncChatSettings();
 
-  // ========= Jobs =========
   let selectedJobId = null;
   let pollTimer = null;
   let serviceOnline = false;
@@ -942,8 +1009,7 @@ def home():
   }
 
   async function refreshJobs(){
-    const r = await api("/api/jobs");
-    const data = await readJsonSafe(r);
+    const data = await readJsonSafe(await api("/api/jobs"));
     renderJobs(data.jobs || []);
   }
 
@@ -984,12 +1050,17 @@ def home():
     document.getElementById("jobError").innerHTML = (st==="error" && job.error)
       ? '<div class="msg err"><b>Error:</b> ' + escapeHtml(job.error) + '</div>' : "";
 
+    const dlEnabled = !!job.download_url;
     document.getElementById("jobOk").innerHTML = (st==="done")
-      ? '<div class="msg ok"><b>Done:</b> Click Download MP4.</div>' : "";
+      ? '<div class="msg ok"><b>Done:</b> ' + (dlEnabled ? 'Click Download MP4.' : 'Set DOWNLOAD_SECRET in Render env to enable downloads.') + '</div>'
+      : "";
 
-    document.getElementById("btnDownload").disabled = (st !== "done");
+    document.getElementById("btnDownload").disabled = (st !== "done" || !dlEnabled);
     document.getElementById("btnDelete").disabled = false;
     document.getElementById("btnCancel").disabled = (st !== "running");
+
+    // Store download_url for button click
+    window.__dl = job.download_url || "";
   }
 
   function startPollingIfNeeded(job){
@@ -1004,14 +1075,11 @@ def home():
             clearInterval(pollTimer);
             pollTimer = null;
           }
-        }catch(e){
-          // ignore transient
-        }
+        }catch(e){}
       }, 2500);
     }
   }
 
-  // ========= Create job =========
   document.getElementById("btnStart").onclick = async () => {
     clearMsg();
     const vod = document.getElementById("vod").value.trim();
@@ -1050,7 +1118,6 @@ def home():
     }
   };
 
-  // ========= Buttons =========
   document.getElementById("btnCancel").onclick = async () => {
     if (!selectedJobId) return;
     try{
@@ -1083,8 +1150,11 @@ def home():
   };
 
   document.getElementById("btnDownload").onclick = () => {
-    if (!selectedJobId) return;
-    window.location.href = "/api/jobs/" + selectedJobId + "/file";
+    if (!window.__dl){
+      alert("No download URL. Set DOWNLOAD_SECRET in Render env and re-run.");
+      return;
+    }
+    window.location.href = window.__dl;
   };
 
   document.getElementById("btnCopyLog").onclick = async () => {
@@ -1123,7 +1193,6 @@ def home():
     }catch(e){}
   };
 
-  // ========= Health + System =========
   async function wakePing(){
     try{
       const r = await fetch("/healthz", { cache: "no-store" });
@@ -1263,7 +1332,7 @@ async def create_job(req: Request):
     job_id = uuid.uuid4().hex
 
     video_path = os.path.join(DOWNLOAD_DIR, f"{vod_id}-{job_id}.video.mp4")
-    # IMPORTANT FIX: chat file MUST be .json (NOT .json.gz)
+    # IMPORTANT FIX: chat output MUST be .json (NOT .json.gz)
     chat_json = os.path.join(DOWNLOAD_DIR, f"{vod_id}-{job_id}.chat.json")
     chat_mp4 = os.path.join(DOWNLOAD_DIR, f"{vod_id}-{job_id}.chat.mp4")
     final_path = os.path.join(DOWNLOAD_DIR, f"{vod_id}-{job_id}.final.mp4")
@@ -1284,6 +1353,8 @@ async def create_job(req: Request):
         "started_at": 0,
         "finished_at": 0,
         "cancel_requested": False,
+        "download_token": "",
+        "download_url": "",
     }
     add_job(job)
 
@@ -1321,6 +1392,7 @@ def job_status(job_id: str, req: Request):
 
 @app.get("/api/jobs/{job_id}/file")
 def job_file(job_id: str, req: Request):
+    # Header-protected download (works with fetch, not direct browser URL)
     auth(req)
     job = get_job_or_404(job_id)
     if job.get("status") != "done":
@@ -1328,7 +1400,7 @@ def job_file(job_id: str, req: Request):
 
     path = job.get("path") or ""
     if not path or not os.path.exists(path):
-        raise HTTPException(410, "file expired or missing (instance restarted / ephemeral storage)")
+        raise HTTPException(410, "file expired or missing")
     return FileResponse(path, filename=os.path.basename(path))
 
 
