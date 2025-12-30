@@ -33,7 +33,6 @@ MAX_JOBS_IN_MEMORY = int(os.environ.get("MAX_JOBS_IN_MEMORY", "30"))
 KEEP_LOG_LINES = int(os.environ.get("KEEP_LOG_LINES", "1200"))
 
 q: "Queue[dict]" = Queue(maxsize=MAX_QUEUE)
-
 jobs: Dict[str, Dict[str, Any]] = {}
 jobs_order: List[str] = []  # newest-first
 
@@ -196,7 +195,7 @@ def run_and_log(job: Dict[str, Any], cmd: List[str], stage: str) -> None:
         text=True,
         bufsize=1,
         env=env,
-        start_new_session=True,  # create process group; allows cancel to kill children too
+        start_new_session=True,  # process group for clean cancel
     )
     job["_proc_pid"] = proc.pid
 
@@ -358,62 +357,78 @@ def worker_loop():
         job["cancel_requested"] = False
 
         try:
-            # Fail fast instead of getting evicted mid-run
             ensure_free_space(DOWNLOAD_DIR, need_free_mb=800)
             ensure_free_space(TD_TEMP_DIR, need_free_mb=200)
 
-            vod_id = payload["vod_id"]
-            quality = payload["quality"]
-            threads = payload["threads"]
-            bandwidth = payload["bandwidth"]
-            beginning = payload["beginning"]
-            ending = payload["ending"]
-            include_chat = payload["include_chat"]
+            run_and_log(
+                job,
+                td_videodownload(
+                    payload["vod_id"],
+                    payload["video_path"],
+                    payload["quality"],
+                    payload["threads"],
+                    payload["bandwidth"],
+                    payload["beginning"],
+                    payload["ending"],
+                ),
+                "VideoDownload",
+            )
 
-            video_path = payload["video_path"]
-            final_path = payload["final_path"]
-
-            run_and_log(job, td_videodownload(vod_id, video_path, quality, threads, bandwidth, beginning, ending), "VideoDownload")
-
-            if include_chat:
-                chat_json = payload["chat_json"]
-                chat_mp4 = payload["chat_mp4"]
-
-                run_and_log(job, td_chatdownload(vod_id, chat_json, threads, beginning, ending), "ChatDownload")
+            if payload["include_chat"]:
+                run_and_log(
+                    job,
+                    td_chatdownload(
+                        payload["vod_id"],
+                        payload["chat_json"],
+                        payload["threads"],
+                        payload["beginning"],
+                        payload["ending"],
+                    ),
+                    "ChatDownload",
+                )
 
                 run_and_log(
                     job,
                     td_chatrender(
-                        chat_json, chat_mp4,
-                        payload["chat_width"], payload["chat_height"],
-                        payload["font_size"], payload["framerate"], payload["update_rate"],
-                        payload["background_color"], payload["outline"]
+                        payload["chat_json"],
+                        payload["chat_mp4"],
+                        payload["chat_width"],
+                        payload["chat_height"],
+                        payload["font_size"],
+                        payload["framerate"],
+                        payload["update_rate"],
+                        payload["background_color"],
+                        payload["outline"],
                     ),
-                    "ChatRender"
+                    "ChatRender",
                 )
 
                 run_and_log(
                     job,
-                    ffmpeg_side_by_side(video_path, chat_mp4, final_path, payload["chat_width"], payload["chat_height"], payload["crf"]),
-                    "Combine (Video + Chat)"
+                    ffmpeg_side_by_side(
+                        payload["video_path"],
+                        payload["chat_mp4"],
+                        payload["final_path"],
+                        payload["chat_width"],
+                        payload["chat_height"],
+                        payload["crf"],
+                    ),
+                    "Combine (Video + Chat)",
                 )
 
-                # cleanup intermediates ASAP
-                cleanup_paths([chat_json, chat_mp4, video_path])
+                cleanup_paths([payload["chat_json"], payload["chat_mp4"], payload["video_path"]])
             else:
-                os.replace(video_path, final_path)
+                os.replace(payload["video_path"], payload["final_path"])
 
             job["status"] = "done"
             job["stage"] = "done"
-            job["path"] = final_path
+            job["path"] = payload["final_path"]
 
         except Exception as e:
             job["status"] = "error"
             job["stage"] = "failed"
             job["error"] = str(e)
             job["hint"] = hint_from_log(job.get("log", ""))
-
-            # cleanup intermediates on failure
             cleanup_paths(job.get("files") or [])
 
         finally:
@@ -426,7 +441,7 @@ threading.Thread(target=worker_loop, daemon=True).start()
 
 
 # =========================
-# API
+# Routes
 # =========================
 @app.get("/healthz")
 def healthz():
@@ -449,6 +464,7 @@ def system(req: Request):
 
 @app.get("/", response_class=HTMLResponse)
 def home():
+    # NOTE: Using double braces in JS/CSS due to Python f-string.
     return f"""
 <!doctype html>
 <html lang="en">
@@ -474,7 +490,6 @@ def home():
       --mono: ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace;
       --sans: ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,"Apple Color Emoji","Segoe UI Emoji";
     }}
-
     *{{box-sizing:border-box}}
     body {{
       margin:0;
@@ -487,236 +502,85 @@ def home():
         linear-gradient(180deg, var(--bg0), var(--bg1));
       min-height:100vh;
     }}
-
     .wrap {{ max-width:1200px; margin:26px auto 70px; padding:0 18px; }}
-    .top {{
-      display:flex; gap:14px; align-items:flex-start; justify-content:space-between;
-      margin-bottom:14px;
-    }}
-    .brand h1 {{
-      margin:0; font-size:20px; letter-spacing:.2px; font-weight:800;
-    }}
-    .brand .sub {{
-      margin-top:6px; color:var(--muted); font-size:13px; line-height:1.45;
-    }}
-    .chips {{
-      display:flex; flex-wrap:wrap; gap:10px; justify-content:flex-end;
-    }}
-    .chip {{
-      display:flex; align-items:center; gap:10px;
-      padding:10px 12px;
-      background:var(--card);
-      border:1px solid var(--line);
-      border-radius:999px;
-      box-shadow:var(--shadow);
-      color:var(--muted);
-      font-size:12px;
-      backdrop-filter: blur(10px);
-    }}
-    .dot {{
-      width:10px; height:10px; border-radius:999px; background:rgba(255,255,255,.35);
-      box-shadow: 0 0 0 3px rgba(255,255,255,.06) inset;
-    }}
-    .dot.good{{ background:var(--good); }}
-    .dot.warn{{ background:var(--warn); }}
-    .dot.bad{{ background:var(--bad); }}
+    .top {{ display:flex; gap:14px; align-items:flex-start; justify-content:space-between; margin-bottom:14px; flex-wrap:wrap; }}
+    .brand h1 {{ margin:0; font-size:20px; letter-spacing:.2px; font-weight:900; }}
+    .brand .sub {{ margin-top:6px; color:var(--muted); font-size:13px; line-height:1.45; }}
+    .chips {{ display:flex; flex-wrap:wrap; gap:10px; justify-content:flex-end; }}
+    .chip {{ display:flex; align-items:center; gap:10px; padding:10px 12px; background:var(--card); border:1px solid var(--line);
+      border-radius:999px; box-shadow:var(--shadow); color:var(--muted); font-size:12px; backdrop-filter: blur(10px); }}
+    .dot {{ width:10px; height:10px; border-radius:999px; background:rgba(255,255,255,.35); box-shadow: 0 0 0 3px rgba(255,255,255,.06) inset; }}
+    .dot.good{{ background:var(--good); }} .dot.warn{{ background:var(--warn); }} .dot.bad{{ background:var(--bad); }}
 
-    .grid {{
-      display:grid;
-      gap:14px;
-      grid-template-columns: 1fr;
-    }}
-    @media(min-width:1020px) {{
-      .grid {{ grid-template-columns: 1.08fr .92fr; align-items:start; }}
-    }}
+    .grid {{ display:grid; gap:14px; grid-template-columns: 1fr; }}
+    @media(min-width:1020px) {{ .grid {{ grid-template-columns: 1.08fr .92fr; align-items:start; }} }}
 
-    .card {{
-      background: linear-gradient(180deg, rgba(255,255,255,.08), rgba(255,255,255,.02));
-      border:1px solid var(--line);
-      border-radius: var(--r);
-      box-shadow: var(--shadow);
-      overflow:hidden;
-      backdrop-filter: blur(10px);
-    }}
-    .hd {{
-      padding:14px 14px;
-      border-bottom:1px solid rgba(255,255,255,.10);
-      display:flex;
-      gap:10px;
-      align-items:center;
-      justify-content:space-between;
-      background: rgba(0,0,0,.14);
-    }}
-    .hd h2 {{
-      margin:0; font-size:13px; letter-spacing:.28px; text-transform:uppercase;
-      color: rgba(234,240,255,.82);
-    }}
+    .card {{ background: linear-gradient(180deg, rgba(255,255,255,.08), rgba(255,255,255,.02));
+      border:1px solid var(--line); border-radius: var(--r); box-shadow: var(--shadow); overflow:hidden; backdrop-filter: blur(10px); }}
+    .hd {{ padding:14px; border-bottom:1px solid rgba(255,255,255,.10); display:flex; gap:10px; align-items:center; justify-content:space-between; background: rgba(0,0,0,.14); }}
+    .hd h2 {{ margin:0; font-size:13px; letter-spacing:.28px; text-transform:uppercase; color: rgba(234,240,255,.82); }}
     .bd {{ padding:14px; }}
-
     .row {{ display:flex; gap:10px; flex-wrap:wrap; }}
     .f {{ flex:1; min-width:220px; }}
     label {{ display:block; margin:0 0 6px; font-size:12px; color:var(--muted); }}
-
-    input, select, button, textarea {{
-      width:100%;
-      font:inherit;
-      color:var(--txt);
-      background: rgba(0,0,0,.18);
-      border:1px solid rgba(255,255,255,.14);
-      border-radius: 14px;
-      padding:10px 12px;
-      outline:none;
+    input, select, button {{
+      width:100%; font:inherit; color:var(--txt); background: rgba(0,0,0,.18);
+      border:1px solid rgba(255,255,255,.14); border-radius: 14px; padding:10px 12px; outline:none;
       transition: border-color .15s ease, transform .08s ease;
     }}
-    input:focus, select:focus, textarea:focus {{
+    input:focus, select:focus {{
       border-color: rgba(96,165,250,.6);
       box-shadow: 0 0 0 4px rgba(96,165,250,.10);
     }}
-
     button {{
-      cursor:pointer;
-      font-weight:800;
-      letter-spacing:.2px;
+      cursor:pointer; font-weight:900; letter-spacing:.2px;
       background: linear-gradient(180deg, rgba(96,165,250,.30), rgba(96,165,250,.16));
       border-color: rgba(96,165,250,.45);
     }}
-    button:hover {{ transform: translateY(-1px); }}
-    button:active {{ transform: translateY(0px); }}
+    button:hover {{ transform: translateY(-1px); }} button:active {{ transform: translateY(0px); }}
+    .btn2 {{ background: rgba(0,0,0,.18); border-color: rgba(255,255,255,.14); font-weight:850; }}
+    .btnBad {{ background: linear-gradient(180deg, rgba(251,113,133,.28), rgba(251,113,133,.12)); border-color: rgba(251,113,133,.45); }}
+    .btnGood {{ background: linear-gradient(180deg, rgba(52,211,153,.25), rgba(52,211,153,.12)); border-color: rgba(52,211,153,.45); }}
 
-    .btn2 {{
-      background: rgba(0,0,0,.18);
-      border-color: rgba(255,255,255,.14);
-      font-weight:750;
-    }}
-    .btnBad {{
-      background: linear-gradient(180deg, rgba(251,113,133,.28), rgba(251,113,133,.12));
-      border-color: rgba(251,113,133,.45);
-    }}
-    .btnGood {{
-      background: linear-gradient(180deg, rgba(52,211,153,.25), rgba(52,211,153,.12));
-      border-color: rgba(52,211,153,.45);
-    }}
-
-    .status {{
-      display:flex; align-items:center; gap:10px; flex-wrap:wrap;
-      padding:12px;
-      border-radius: 16px;
-      border:1px solid rgba(255,255,255,.12);
-      background: rgba(0,0,0,.16);
-      margin-bottom: 12px;
-    }}
-    .status .title {{ font-weight:900; }}
+    .status {{ display:flex; align-items:center; gap:10px; flex-wrap:wrap; padding:12px; border-radius: 16px;
+      border:1px solid rgba(255,255,255,.12); background: rgba(0,0,0,.16); margin-bottom: 12px; }}
+    .status .title {{ font-weight:950; }}
     .status .sub {{ color:var(--muted); font-size:12px; line-height:1.35; }}
-    .badge {{
-      margin-left:auto;
-      font-size:12px;
-      padding:5px 10px;
-      border-radius:999px;
-      border:1px solid rgba(255,255,255,.14);
-      color: rgba(234,240,255,.75);
-      background: rgba(0,0,0,.12);
-    }}
+    .badge {{ margin-left:auto; font-size:12px; padding:5px 10px; border-radius:999px; border:1px solid rgba(255,255,255,.14);
+      color: rgba(234,240,255,.75); background: rgba(0,0,0,.12); }}
     .badge.good{{ border-color: rgba(52,211,153,.55); color: rgba(52,211,153,.92); }}
     .badge.warn{{ border-color: rgba(251,191,36,.60); color: rgba(251,191,36,.95); }}
     .badge.bad{{ border-color: rgba(251,113,133,.60); color: rgba(251,113,133,.95); }}
 
-    details {{
-      border:1px solid rgba(255,255,255,.12);
-      border-radius: 16px;
-      padding: 10px 12px;
-      background: rgba(0,0,0,.14);
-    }}
-    summary {{
-      cursor:pointer;
-      font-weight:900;
-      letter-spacing:.15px;
-    }}
+    details {{ border:1px solid rgba(255,255,255,.12); border-radius: 16px; padding: 10px 12px; background: rgba(0,0,0,.14); }}
+    summary {{ cursor:pointer; font-weight:950; letter-spacing:.15px; }}
     .muted {{ color:var(--muted); font-size:12.5px; line-height:1.5; }}
-
-    .toggle {{
-      display:flex; align-items:flex-start; gap:12px;
-      padding: 12px;
-      border-radius: 16px;
-      border:1px solid rgba(255,255,255,.12);
-      background: rgba(0,0,0,.14);
-      user-select:none;
-      margin-top:10px;
-    }}
-    .toggle input {{
-      width:auto;
-      transform: translateY(2px) scale(1.15);
-      accent-color: var(--accent);
-    }}
+    .toggle {{ display:flex; align-items:flex-start; gap:12px; padding: 12px; border-radius: 16px;
+      border:1px solid rgba(255,255,255,.12); background: rgba(0,0,0,.14); user-select:none; margin-top:10px; }}
+    .toggle input {{ width:auto; transform: translateY(2px) scale(1.15); accent-color: var(--accent); }}
 
     .jobs {{ display:flex; flex-direction:column; gap:10px; }}
-    .job {{
-      padding: 12px;
-      border-radius: 16px;
-      border:1px solid rgba(255,255,255,.12);
-      background: rgba(0,0,0,.14);
-      cursor:pointer;
-      transition: border-color .15s ease, transform .08s ease;
-    }}
+    .job {{ padding: 12px; border-radius: 16px; border:1px solid rgba(255,255,255,.12); background: rgba(0,0,0,.14); cursor:pointer;
+      transition: border-color .15s ease, transform .08s ease; }}
     .job:hover {{ border-color: rgba(96,165,250,.55); transform: translateY(-1px); }}
     .job.active {{ border-color: rgba(96,165,250,.85); box-shadow: 0 0 0 4px rgba(96,165,250,.10); }}
     .jobTop {{ display:flex; justify-content:space-between; gap:10px; align-items:center; }}
     .jobTitle {{ font-weight:950; }}
     .jobMeta {{ color:var(--muted); font-size:12px; margin-top:6px; }}
     .mono {{ font-family: var(--mono); }}
-    pre {{
-      margin:0;
-      border-radius: 16px;
-      padding: 12px;
-      background: rgba(0,0,0,.22);
-      border:1px solid rgba(255,255,255,.12);
-      overflow:auto;
-      max-height: 440px;
-      font-size: 12px;
-      line-height: 1.45;
-    }}
+    pre {{ margin:0; border-radius: 16px; padding: 12px; background: rgba(0,0,0,.22); border:1px solid rgba(255,255,255,.12);
+      overflow:auto; max-height: 440px; font-size: 12px; line-height: 1.45; }}
 
-    .msg {{
-      margin-top: 10px;
-      padding: 10px 12px;
-      border-radius: 16px;
-      border:1px solid rgba(255,255,255,.12);
-      background: rgba(0,0,0,.14);
-      font-size: 12.5px;
-      line-height: 1.45;
-    }}
-    .msg.ok {{
-      border-color: rgba(52,211,153,.38);
-      background: rgba(52,211,153,.08);
-      color: rgba(52,211,153,.95);
-    }}
-    .msg.err {{
-      border-color: rgba(251,113,133,.38);
-      background: rgba(251,113,133,.08);
-      color: rgba(251,113,133,.95);
-    }}
-    .msg.hint {{
-      border-color: rgba(251,191,36,.38);
-      background: rgba(251,191,36,.07);
-      color: rgba(251,191,36,.95);
-    }}
+    .msg {{ margin-top: 10px; padding: 10px 12px; border-radius: 16px; border:1px solid rgba(255,255,255,.12);
+      background: rgba(0,0,0,.14); font-size: 12.5px; line-height: 1.45; }}
+    .msg.ok {{ border-color: rgba(52,211,153,.38); background: rgba(52,211,153,.08); color: rgba(52,211,153,.95); }}
+    .msg.err {{ border-color: rgba(251,113,133,.38); background: rgba(251,113,133,.08); color: rgba(251,113,133,.95); }}
+    .msg.hint {{ border-color: rgba(251,191,36,.38); background: rgba(251,191,36,.07); color: rgba(251,191,36,.95); }}
 
-    .actions {{
-      display:flex;
-      gap:10px;
-      flex-wrap:wrap;
-      margin-top: 10px;
-    }}
+    .actions {{ display:flex; gap:10px; flex-wrap:wrap; margin-top: 10px; }}
     .actions > button {{ flex:1; min-width:220px; }}
-
-    .tiny {{
-      font-size: 11.5px;
-      color: rgba(234,240,255,.55);
-    }}
-    .hr {{
-      height:1px;
-      background: rgba(255,255,255,.10);
-      margin: 12px 0;
-    }}
+    .tiny {{ font-size: 11.5px; color: rgba(234,240,255,.55); }}
+    .hr {{ height:1px; background: rgba(255,255,255,.10); margin: 12px 0; }}
   </style>
 </head>
 <body>
@@ -725,30 +589,29 @@ def home():
     <div class="brand">
       <h1>TwitchDownloader – Render Free</h1>
       <div class="sub">
-        1080p video + optional chat render. For long VODs, use chunks (1h recommended on Free).<br/>
-        Storage dirs: <span class="mono">{DOWNLOAD_DIR}</span> • temp: <span class="mono">{TD_TEMP_DIR}</span>
+        1080p video + optional chat render. On Free, prefer 1-hour chunks to avoid storage limits.<br/>
+        Storage: <span class="mono">{DOWNLOAD_DIR}</span> • Temp: <span class="mono">{TD_TEMP_DIR}</span>
       </div>
     </div>
-
     <div class="chips">
       <div class="chip">
         <span id="wakeDot" class="dot warn"></span>
         <div>
-          <div style="font-weight:900;color:rgba(234,240,255,.85)">Service</div>
+          <div style="font-weight:950;color:rgba(234,240,255,.85)">Service</div>
           <div class="tiny" id="wakeText">Warming up…</div>
         </div>
       </div>
       <div class="chip">
         <span id="sysDot" class="dot warn"></span>
         <div>
-          <div style="font-weight:900;color:rgba(234,240,255,.85)">Disk Free</div>
+          <div style="font-weight:950;color:rgba(234,240,255,.85)">Disk Free</div>
           <div class="tiny" id="diskText">—</div>
         </div>
       </div>
       <div class="chip">
         <span class="dot" style="background:rgba(255,255,255,.35)"></span>
         <div>
-          <div style="font-weight:900;color:rgba(234,240,255,.85)">Queue</div>
+          <div style="font-weight:950;color:rgba(234,240,255,.85)">Queue</div>
           <div class="tiny" id="queueText">—</div>
         </div>
       </div>
@@ -756,7 +619,6 @@ def home():
   </div>
 
   <div class="grid">
-    <!-- Left -->
     <section class="card">
       <div class="hd">
         <h2>Create Job</h2>
@@ -765,7 +627,6 @@ def home():
         </div>
       </div>
       <div class="bd">
-
         <div class="status">
           <span id="statusDot" class="dot"></span>
           <div style="flex:1">
@@ -806,7 +667,7 @@ def home():
         <details style="margin-top:10px" open>
           <summary>Chunking (Begin / End)</summary>
           <div class="muted" style="margin:10px 0 12px">
-            Tip: On Render Free, use <b>1-hour chunks</b> for 1080p to avoid storage limits.
+            Tip: On Render Free, use <b>1-hour chunks</b> for 1080p downloads.
           </div>
           <div class="row">
             <div class="f">
@@ -846,7 +707,7 @@ def home():
         </div>
 
         <details style="margin-top:10px" id="chatSettings">
-          <summary>Chat render settings (smaller defaults)</summary>
+          <summary>Chat render settings</summary>
           <div class="row" style="margin-top:10px">
             <div class="f">
               <label>Chat width (px)</label>
@@ -880,7 +741,6 @@ def home():
               </select>
             </div>
           </div>
-
           <div class="row" style="margin-top:10px">
             <div class="f">
               <label>Final encode size (CRF)</label>
@@ -891,10 +751,7 @@ def home():
               </select>
               <div class="tiny" style="margin-top:6px">Lower CRF = higher quality + bigger files.</div>
             </div>
-            <div class="f">
-              <label>Preset</label>
-              <div class="tiny" style="margin-top:10px">Using ffmpeg preset: <span class="mono">veryfast</span></div>
-            </div>
+            <div class="f"></div>
           </div>
         </details>
 
@@ -904,28 +761,23 @@ def home():
         </div>
 
         <div id="msgArea"></div>
-
       </div>
     </section>
 
-    <!-- Right -->
     <section class="card">
       <div class="hd">
         <h2>Jobs & Logs</h2>
         <div style="display:flex;gap:10px">
           <button class="btn2" id="btnRefresh">Refresh</button>
-          <button class="btn2" id="btnClearToken">Clear Token</button>
         </div>
       </div>
       <div class="bd">
         <div class="muted">
-          Click a job to view. Logs show the last ~300 lines. Use the filter to find errors.
+          Click a job to view. Logs show the last ~300 lines. Use filter to find errors.
         </div>
 
         <div class="hr"></div>
-
         <div class="jobs" id="jobsList"></div>
-
         <div class="hr"></div>
 
         <div class="row">
@@ -956,7 +808,6 @@ def home():
         </div>
       </div>
     </section>
-
   </div>
 </div>
 
@@ -983,14 +834,7 @@ def home():
     setToken(trimmed);
   }};
 
-  document.getElementById("btnClearToken").onclick = () => {{
-    if (confirm("Clear saved token from this browser?")) {{
-      clearToken();
-      showMsg("Token cleared.", "hint");
-    }}
-  }};
-
-  // ========= UI helpers =========
+  // ========= UI =========
   function setStatus(kind, title, sub) {{
     const dot = document.getElementById("statusDot");
     dot.className = "dot " + (kind || "");
@@ -998,15 +842,35 @@ def home():
     document.getElementById("statusSub").textContent = sub || "";
   }}
 
-  function showMsg(text, cls) {{
-    const m = document.getElementById("msgArea");
-    m.innerHTML = '<div class="msg ' + (cls||"") + '">' + text + '</div>';
-  }}
-
-  function clearMsg() {{ document.getElementById("msgArea").innerHTML = ""; }}
-
   function escapeHtml(s) {{
     return (s||"").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;");
+  }}
+
+  function showMsg(text, cls) {{
+    document.getElementById("msgArea").innerHTML =
+      '<div class="msg ' + (cls||"") + '">' + text + '</div>';
+  }}
+  function clearMsg() {{ document.getElementById("msgArea").innerHTML = ""; }}
+
+  // ========= Safe JSON read (fixes "Unexpected end of JSON input") =========
+  async function readJsonSafe(res) {{
+    const text = await res.text();
+    if (!text) throw new Error(`Empty response (${res.status}) - instance may have restarted/slept`);
+    let data;
+    try {{ data = JSON.parse(text); }}
+    catch {{ throw new Error(`Invalid JSON (${res.status}): ` + text.slice(0, 140)); }}
+    if (!res.ok) {{
+      const msg = data?.detail || data?.error || text;
+      throw new Error(msg);
+    }}
+    return data;
+  }}
+
+  async function api(path, opts={{}}) {{
+    const t = getToken();
+    if (!t) throw new Error("Token not set. Click Set Token.");
+    const headers = Object.assign({{}}, opts.headers || {{}}, {{"X-Admin-Token": t}});
+    return fetch(path, Object.assign({{}}, opts, {{ headers }}));
   }}
 
   function fmtElapsed(job) {{
@@ -1048,10 +912,8 @@ def home():
     const mins = chunkMinutes();
     const b = document.getElementById("begin").value.trim() || "00:00:00";
     const e = document.getElementById("end").value.trim() || fromSeconds(mins*60);
-    const b2 = toSeconds(b) + mins*60;
-    const e2 = toSeconds(e) + mins*60;
-    document.getElementById("begin").value = fromSeconds(b2);
-    document.getElementById("end").value = fromSeconds(e2);
+    document.getElementById("begin").value = fromSeconds(toSeconds(b) + mins*60);
+    document.getElementById("end").value = fromSeconds(toSeconds(e) + mins*60);
   }};
 
   // ========= Chat toggle =========
@@ -1061,14 +923,6 @@ def home():
   }}
   includeChatEl.onchange = syncChatSettings;
   syncChatSettings();
-
-  // ========= API =========
-  async function api(path, opts={{}}) {{
-    const t = getToken();
-    if (!t) throw new Error("Token not set. Click Set Token.");
-    const headers = Object.assign({{}}, opts.headers || {{}}, {{"X-Admin-Token": t}});
-    return fetch(path, Object.assign({{}}, opts, {{ headers }}));
-  }}
 
   // ========= Jobs =========
   let selectedJobId = null;
@@ -1108,24 +962,23 @@ def home():
 
   async function refreshJobs() {{
     const r = await api("/api/jobs");
-    const data = await r.json();
+    const data = await readJsonSafe(r);
     renderJobs(data.jobs || []);
-    if (selectedJobId) await selectJob(selectedJobId, true);
   }}
 
   window.selectJob = async function(jobId, silent=false) {{
     selectedJobId = jobId;
     if (!silent) clearMsg();
+
     document.getElementById("btnDownload").disabled = true;
     document.getElementById("btnDelete").disabled = true;
     document.getElementById("btnCancel").disabled = true;
 
     const r = await api("/api/jobs/" + jobId);
-    const job = await r.json();
+    const job = await readJsonSafe(r);
 
     updateDetail(job);
     await refreshJobs();
-
     startPollingIfNeeded(job);
   }}
 
@@ -1139,13 +992,16 @@ def home():
     const filter = document.getElementById("logFilter").value.trim().toLowerCase();
     const lines = (job.log || "").split("\\n");
     const filtered = filter ? lines.filter(x => x.toLowerCase().includes(filter)) : lines;
-    const tail = filtered.slice(-300).join("\\n");
-    document.getElementById("logBox").textContent = tail || "(no log yet)";
+    document.getElementById("logBox").textContent = filtered.slice(-300).join("\\n") || "(no log yet)";
 
-    const hint = job.hint || "";
-    document.getElementById("jobHint").innerHTML = hint ? '<div class="msg hint"><b>Hint:</b> ' + escapeHtml(hint) + '</div>' : "";
-    document.getElementById("jobError").innerHTML = (st==="error" && job.error) ? '<div class="msg err"><b>Error:</b> ' + escapeHtml(job.error) + '</div>' : "";
-    document.getElementById("jobOk").innerHTML = (st==="done") ? '<div class="msg ok"><b>Done:</b> Click Download MP4.</div>' : "";
+    document.getElementById("jobHint").innerHTML = job.hint
+      ? '<div class="msg hint"><b>Hint:</b> ' + escapeHtml(job.hint) + '</div>' : "";
+
+    document.getElementById("jobError").innerHTML = (st==="error" && job.error)
+      ? '<div class="msg err"><b>Error:</b> ' + escapeHtml(job.error) + '</div>' : "";
+
+    document.getElementById("jobOk").innerHTML = (st==="done")
+      ? '<div class="msg ok"><b>Done:</b> Click Download MP4.</div>' : "";
 
     document.getElementById("btnDownload").disabled = (st !== "done");
     document.getElementById("btnDelete").disabled = false;
@@ -1158,16 +1014,15 @@ def home():
       pollTimer = setInterval(async () => {{
         try {{
           const r = await api("/api/jobs/" + selectedJobId);
-          const j = await r.json();
+          const j = await readJsonSafe(r);
           updateDetail(j);
-          const listData = await (await api("/api/jobs")).json();
-          renderJobs(listData.jobs || []);
+          await refreshJobs();
           if (j.status !== "running" && j.status !== "queued") {{
             clearInterval(pollTimer);
             pollTimer = null;
           }}
         }} catch(e) {{
-          // ignore transient
+          // If instance restarts, you may get empty response; ignore transient
         }}
       }}, 2500);
     }}
@@ -1187,7 +1042,6 @@ def home():
       beginning: document.getElementById("begin").value.trim(),
       ending: document.getElementById("end").value.trim(),
       include_chat: document.getElementById("include_chat").checked,
-
       chat_width: document.getElementById("chat_width").value.trim(),
       font_size: document.getElementById("font_size").value.trim(),
       framerate: document.getElementById("framerate").value.trim(),
@@ -1204,17 +1058,7 @@ def home():
         headers: {{"Content-Type":"application/json"}},
         body: JSON.stringify(payload)
       }});
-      const txt = await r.text();
-      if (!r.ok) {{
-        let msg = txt;
-        try {{
-          const j = JSON.parse(txt);
-          msg = j.detail || txt;
-        }} catch(_) {{}}
-        setStatus("bad", "Error", msg);
-        return showMsg(escapeHtml(msg), "err");
-      }}
-      const data = JSON.parse(txt);
+      const data = await readJsonSafe(r);
       showMsg("Job created: <span class='mono'>" + data.job_id + "</span>", "ok");
       await refreshJobs();
       await selectJob(data.job_id);
@@ -1224,11 +1068,11 @@ def home():
     }}
   }};
 
-  // ========= Actions =========
+  // ========= Buttons =========
   document.getElementById("btnCancel").onclick = async () => {{
     if (!selectedJobId) return;
     try {{
-      await api("/api/jobs/" + selectedJobId + "/cancel", {{ method: "POST" }});
+      await readJsonSafe(await api("/api/jobs/" + selectedJobId + "/cancel", {{ method: "POST" }}));
       showMsg("Cancel requested.", "hint");
       await selectJob(selectedJobId, true);
     }} catch(e) {{
@@ -1239,7 +1083,7 @@ def home():
   document.getElementById("btnDelete").onclick = async () => {{
     if (!selectedJobId) return;
     try {{
-      await api("/api/jobs/" + selectedJobId + "/delete", {{ method: "POST" }});
+      await readJsonSafe(await api("/api/jobs/" + selectedJobId + "/delete", {{ method: "POST" }}));
       selectedJobId = null;
       document.getElementById("logBox").textContent = "Select a job to see logs.";
       document.getElementById("jobHint").innerHTML = "";
@@ -1264,7 +1108,7 @@ def home():
   document.getElementById("btnCopyLog").onclick = async () => {{
     const t = document.getElementById("logBox").textContent;
     await navigator.clipboard.writeText(t);
-    showMsg("Copied log to clipboard.", "ok");
+    showMsg("Copied log.", "ok");
   }};
 
   document.getElementById("btnDownloadLog").onclick = () => {{
@@ -1289,19 +1133,18 @@ def home():
   document.getElementById("logFilter").oninput = async () => {{
     if (!selectedJobId) return;
     try {{
-      const r = await api("/api/jobs/" + selectedJobId);
-      updateDetail(await r.json());
+      updateDetail(await readJsonSafe(await api("/api/jobs/" + selectedJobId)));
     }} catch(e) {{}}
   }};
 
-  // ========= Health + System metrics =========
+  // ========= Health + System =========
   async function wakePing() {{
     try {{
       const r = await fetch("/healthz");
-      if (!r.ok) throw new Error("healthz not ok");
+      if (!r.ok) throw new Error();
       document.getElementById("wakeDot").className = "dot good";
       document.getElementById("wakeText").textContent = "Online";
-    }} catch(_) {{
+    }} catch(e) {{
       document.getElementById("wakeDot").className = "dot warn";
       document.getElementById("wakeText").textContent = "Warming up…";
     }}
@@ -1311,24 +1154,19 @@ def home():
     const dot = document.getElementById("sysDot");
     const diskText = document.getElementById("diskText");
     const queueText = document.getElementById("queueText");
-
     try {{
-      const t = getToken();
-      if (!t) {{
+      if (!getToken()) {{
         dot.className = "dot warn";
         diskText.textContent = "— (set token)";
         queueText.textContent = "—";
         return;
       }}
-      const r = await api("/api/system");
-      const s = await r.json();
-
+      const s = await readJsonSafe(await api("/api/system"));
       const free = s.disk_download_dir?.free_mb ?? 0;
       const total = s.disk_download_dir?.total_mb ?? 0;
+      diskText.textContent = free + "MB / " + total + "MB";
       const qsz = s.queue?.size ?? 0;
       const qmax = s.queue?.max ?? 0;
-
-      diskText.textContent = free + "MB / " + total + "MB";
       queueText.textContent = qsz + " / " + qmax;
 
       if (free < 500) dot.className = "dot bad";
@@ -1341,20 +1179,17 @@ def home():
     }}
   }}
 
-  // ========= Init =========
+  // Init
   updateTokenBadge();
   setStatus("", "Idle", "Ready.");
   wakePing();
   setInterval(wakePing, 60000);
-
   sysPing();
   setInterval(sysPing, 20000);
 
   (async () => {{
     try {{
-      if (getToken()) {{
-        await refreshJobs();
-      }}
+      if (getToken()) await refreshJobs();
     }} catch(e) {{}}
   }})();
 </script>
@@ -1478,12 +1313,10 @@ async def create_job(req: Request):
         "beginning": beginning,
         "ending": ending,
         "include_chat": include_chat,
-
         "video_path": video_path,
         "chat_json": chat_json,
         "chat_mp4": chat_mp4,
         "final_path": final_path,
-
         "chat_width": chat_width,
         "chat_height": 1080,
         "font_size": font_size,
