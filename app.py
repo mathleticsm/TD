@@ -20,7 +20,7 @@ app = FastAPI()
 # =========================
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
 
-# IMPORTANT: avoid Render's /tmp 2GB temp cap
+# Avoid Render Free /tmp 2GB temp limit
 DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "/app/storage")
 TD_TEMP_DIR = os.environ.get("TD_TEMP_DIR", "/app/tdtmp")
 
@@ -67,7 +67,7 @@ def ensure_free_space(path: str, need_free_mb: int) -> None:
     if free_mb < need_free_mb:
         raise RuntimeError(
             f"Not enough free disk space in {path} ({free_mb}MB free). "
-            f"Use smaller chunks (e.g., 1 hour) or lower quality."
+            f"Use smaller chunks (1 hour), lower quality, or higher CRF."
         )
 
 
@@ -146,15 +146,14 @@ def hint_from_log(log: str) -> str:
         return ""
     if "Couldn't find a valid ICU package installed" in log or "dotnet-missing-libicu" in log:
         return "Missing ICU. Install `libicu-dev` in Dockerfile and redeploy."
-    if "exceeded the limit of 2GB" in log or "temporary storage volume /tmp exceeded" in log.lower():
+    if "temporary storage volume /tmp exceeded" in log.lower():
         return (
-            "You hit Render's /tmp 2GB cap. Make sure DOWNLOAD_DIR and TD_TEMP_DIR are NOT under /tmp, "
-            "and use chunks (1 hour recommended on Free)."
+            "Hit Render /tmp 2GB cap. Keep storage/temp OUT of /tmp, and use 1-hour chunks for 1080p."
         )
     if "Quality not found" in log or "Unable to find requested quality" in log:
-        return "That quality isn't available for this VOD. Try 1080p (not 1080p60) or Auto."
+        return "Quality unavailable. Try 1080p (not 1080p60) or Auto."
     if "429" in log or "Too Many Requests" in log:
-        return "Twitch rate-limited you. Keep threads=2 and consider bandwidth (e.g., 4000 KiB/s)."
+        return "Rate limited. Keep threads=2 and consider bandwidth like 4000 KiB/s."
     return ""
 
 
@@ -195,7 +194,7 @@ def run_and_log(job: Dict[str, Any], cmd: List[str], stage: str) -> None:
         text=True,
         bufsize=1,
         env=env,
-        start_new_session=True,  # process group for clean cancel
+        start_new_session=True,
     )
     job["_proc_pid"] = proc.pid
 
@@ -204,7 +203,7 @@ def run_and_log(job: Dict[str, Any], cmd: List[str], stage: str) -> None:
             for line in proc.stdout:
                 append_log(job, line.rstrip())
                 if job.get("cancel_requested"):
-                    append_log(job, "Cancel requested: terminating process group…")
+                    append_log(job, "Cancel requested: terminating…")
                     terminate_process_group(proc)
                     break
 
@@ -464,123 +463,97 @@ def system(req: Request):
 
 @app.get("/", response_class=HTMLResponse)
 def home():
-    # NOTE: Using double braces in JS/CSS due to Python f-string.
-    return f"""
-<!doctype html>
+    # NOT an f-string. We'll replace placeholders safely.
+    html = """<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>TwitchDownloader – Render Free</title>
   <style>
-    :root {{
-      --bg0:#070A12;
-      --bg1:#0B1020;
-      --card:rgba(255,255,255,.06);
-      --line:rgba(255,255,255,.12);
-      --txt:#EAF0FF;
-      --muted:rgba(234,240,255,.65);
-      --good:#34d399;
-      --warn:#fbbf24;
-      --bad:#fb7185;
-      --accent:#60a5fa;
-      --accent2:#a78bfa;
-      --shadow: 0 18px 45px rgba(0,0,0,.45);
-      --r:18px;
+    :root {
+      --bg0:#070A12; --bg1:#0B1020; --card:rgba(255,255,255,.06); --line:rgba(255,255,255,.12);
+      --txt:#EAF0FF; --muted:rgba(234,240,255,.65);
+      --good:#34d399; --warn:#fbbf24; --bad:#fb7185; --accent:#60a5fa; --accent2:#a78bfa;
+      --shadow: 0 18px 45px rgba(0,0,0,.45); --r:18px;
       --mono: ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace;
       --sans: ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,"Apple Color Emoji","Segoe UI Emoji";
-    }}
-    *{{box-sizing:border-box}}
-    body {{
-      margin:0;
-      font-family:var(--sans);
-      color:var(--txt);
+    }
+    *{box-sizing:border-box}
+    body{
+      margin:0;font-family:var(--sans);color:var(--txt);min-height:100vh;
       background:
         radial-gradient(1200px 900px at 12% 8%, rgba(96,165,250,.22), transparent 55%),
         radial-gradient(900px 700px at 88% 18%, rgba(167,139,250,.18), transparent 55%),
         radial-gradient(1000px 700px at 50% 110%, rgba(52,211,153,.10), transparent 55%),
         linear-gradient(180deg, var(--bg0), var(--bg1));
-      min-height:100vh;
-    }}
-    .wrap {{ max-width:1200px; margin:26px auto 70px; padding:0 18px; }}
-    .top {{ display:flex; gap:14px; align-items:flex-start; justify-content:space-between; margin-bottom:14px; flex-wrap:wrap; }}
-    .brand h1 {{ margin:0; font-size:20px; letter-spacing:.2px; font-weight:900; }}
-    .brand .sub {{ margin-top:6px; color:var(--muted); font-size:13px; line-height:1.45; }}
-    .chips {{ display:flex; flex-wrap:wrap; gap:10px; justify-content:flex-end; }}
-    .chip {{ display:flex; align-items:center; gap:10px; padding:10px 12px; background:var(--card); border:1px solid var(--line);
-      border-radius:999px; box-shadow:var(--shadow); color:var(--muted); font-size:12px; backdrop-filter: blur(10px); }}
-    .dot {{ width:10px; height:10px; border-radius:999px; background:rgba(255,255,255,.35); box-shadow: 0 0 0 3px rgba(255,255,255,.06) inset; }}
-    .dot.good{{ background:var(--good); }} .dot.warn{{ background:var(--warn); }} .dot.bad{{ background:var(--bad); }}
-
-    .grid {{ display:grid; gap:14px; grid-template-columns: 1fr; }}
-    @media(min-width:1020px) {{ .grid {{ grid-template-columns: 1.08fr .92fr; align-items:start; }} }}
-
-    .card {{ background: linear-gradient(180deg, rgba(255,255,255,.08), rgba(255,255,255,.02));
-      border:1px solid var(--line); border-radius: var(--r); box-shadow: var(--shadow); overflow:hidden; backdrop-filter: blur(10px); }}
-    .hd {{ padding:14px; border-bottom:1px solid rgba(255,255,255,.10); display:flex; gap:10px; align-items:center; justify-content:space-between; background: rgba(0,0,0,.14); }}
-    .hd h2 {{ margin:0; font-size:13px; letter-spacing:.28px; text-transform:uppercase; color: rgba(234,240,255,.82); }}
-    .bd {{ padding:14px; }}
-    .row {{ display:flex; gap:10px; flex-wrap:wrap; }}
-    .f {{ flex:1; min-width:220px; }}
-    label {{ display:block; margin:0 0 6px; font-size:12px; color:var(--muted); }}
-    input, select, button {{
-      width:100%; font:inherit; color:var(--txt); background: rgba(0,0,0,.18);
-      border:1px solid rgba(255,255,255,.14); border-radius: 14px; padding:10px 12px; outline:none;
-      transition: border-color .15s ease, transform .08s ease;
-    }}
-    input:focus, select:focus {{
-      border-color: rgba(96,165,250,.6);
-      box-shadow: 0 0 0 4px rgba(96,165,250,.10);
-    }}
-    button {{
-      cursor:pointer; font-weight:900; letter-spacing:.2px;
-      background: linear-gradient(180deg, rgba(96,165,250,.30), rgba(96,165,250,.16));
-      border-color: rgba(96,165,250,.45);
-    }}
-    button:hover {{ transform: translateY(-1px); }} button:active {{ transform: translateY(0px); }}
-    .btn2 {{ background: rgba(0,0,0,.18); border-color: rgba(255,255,255,.14); font-weight:850; }}
-    .btnBad {{ background: linear-gradient(180deg, rgba(251,113,133,.28), rgba(251,113,133,.12)); border-color: rgba(251,113,133,.45); }}
-    .btnGood {{ background: linear-gradient(180deg, rgba(52,211,153,.25), rgba(52,211,153,.12)); border-color: rgba(52,211,153,.45); }}
-
-    .status {{ display:flex; align-items:center; gap:10px; flex-wrap:wrap; padding:12px; border-radius: 16px;
-      border:1px solid rgba(255,255,255,.12); background: rgba(0,0,0,.16); margin-bottom: 12px; }}
-    .status .title {{ font-weight:950; }}
-    .status .sub {{ color:var(--muted); font-size:12px; line-height:1.35; }}
-    .badge {{ margin-left:auto; font-size:12px; padding:5px 10px; border-radius:999px; border:1px solid rgba(255,255,255,.14);
-      color: rgba(234,240,255,.75); background: rgba(0,0,0,.12); }}
-    .badge.good{{ border-color: rgba(52,211,153,.55); color: rgba(52,211,153,.92); }}
-    .badge.warn{{ border-color: rgba(251,191,36,.60); color: rgba(251,191,36,.95); }}
-    .badge.bad{{ border-color: rgba(251,113,133,.60); color: rgba(251,113,133,.95); }}
-
-    details {{ border:1px solid rgba(255,255,255,.12); border-radius: 16px; padding: 10px 12px; background: rgba(0,0,0,.14); }}
-    summary {{ cursor:pointer; font-weight:950; letter-spacing:.15px; }}
-    .muted {{ color:var(--muted); font-size:12.5px; line-height:1.5; }}
-    .toggle {{ display:flex; align-items:flex-start; gap:12px; padding: 12px; border-radius: 16px;
-      border:1px solid rgba(255,255,255,.12); background: rgba(0,0,0,.14); user-select:none; margin-top:10px; }}
-    .toggle input {{ width:auto; transform: translateY(2px) scale(1.15); accent-color: var(--accent); }}
-
-    .jobs {{ display:flex; flex-direction:column; gap:10px; }}
-    .job {{ padding: 12px; border-radius: 16px; border:1px solid rgba(255,255,255,.12); background: rgba(0,0,0,.14); cursor:pointer;
-      transition: border-color .15s ease, transform .08s ease; }}
-    .job:hover {{ border-color: rgba(96,165,250,.55); transform: translateY(-1px); }}
-    .job.active {{ border-color: rgba(96,165,250,.85); box-shadow: 0 0 0 4px rgba(96,165,250,.10); }}
-    .jobTop {{ display:flex; justify-content:space-between; gap:10px; align-items:center; }}
-    .jobTitle {{ font-weight:950; }}
-    .jobMeta {{ color:var(--muted); font-size:12px; margin-top:6px; }}
-    .mono {{ font-family: var(--mono); }}
-    pre {{ margin:0; border-radius: 16px; padding: 12px; background: rgba(0,0,0,.22); border:1px solid rgba(255,255,255,.12);
-      overflow:auto; max-height: 440px; font-size: 12px; line-height: 1.45; }}
-
-    .msg {{ margin-top: 10px; padding: 10px 12px; border-radius: 16px; border:1px solid rgba(255,255,255,.12);
-      background: rgba(0,0,0,.14); font-size: 12.5px; line-height: 1.45; }}
-    .msg.ok {{ border-color: rgba(52,211,153,.38); background: rgba(52,211,153,.08); color: rgba(52,211,153,.95); }}
-    .msg.err {{ border-color: rgba(251,113,133,.38); background: rgba(251,113,133,.08); color: rgba(251,113,133,.95); }}
-    .msg.hint {{ border-color: rgba(251,191,36,.38); background: rgba(251,191,36,.07); color: rgba(251,191,36,.95); }}
-
-    .actions {{ display:flex; gap:10px; flex-wrap:wrap; margin-top: 10px; }}
-    .actions > button {{ flex:1; min-width:220px; }}
-    .tiny {{ font-size: 11.5px; color: rgba(234,240,255,.55); }}
-    .hr {{ height:1px; background: rgba(255,255,255,.10); margin: 12px 0; }}
+    }
+    .wrap{max-width:1200px;margin:26px auto 70px;padding:0 18px}
+    .top{display:flex;gap:14px;align-items:flex-start;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap}
+    .brand h1{margin:0;font-size:20px;letter-spacing:.2px;font-weight:900}
+    .brand .sub{margin-top:6px;color:var(--muted);font-size:13px;line-height:1.45}
+    .chips{display:flex;flex-wrap:wrap;gap:10px;justify-content:flex-end}
+    .chip{display:flex;align-items:center;gap:10px;padding:10px 12px;background:var(--card);border:1px solid var(--line);
+      border-radius:999px;box-shadow:var(--shadow);color:var(--muted);font-size:12px;backdrop-filter: blur(10px)}
+    .dot{width:10px;height:10px;border-radius:999px;background:rgba(255,255,255,.35);box-shadow:0 0 0 3px rgba(255,255,255,.06) inset}
+    .dot.good{background:var(--good)} .dot.warn{background:var(--warn)} .dot.bad{background:var(--bad)}
+    .grid{display:grid;gap:14px;grid-template-columns:1fr}
+    @media(min-width:1020px){.grid{grid-template-columns:1.08fr .92fr;align-items:start}}
+    .card{background:linear-gradient(180deg, rgba(255,255,255,.08), rgba(255,255,255,.02));
+      border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--shadow);overflow:hidden;backdrop-filter: blur(10px)}
+    .hd{padding:14px;border-bottom:1px solid rgba(255,255,255,.10);display:flex;gap:10px;align-items:center;justify-content:space-between;background:rgba(0,0,0,.14)}
+    .hd h2{margin:0;font-size:13px;letter-spacing:.28px;text-transform:uppercase;color:rgba(234,240,255,.82)}
+    .bd{padding:14px}
+    .row{display:flex;gap:10px;flex-wrap:wrap}
+    .f{flex:1;min-width:220px}
+    label{display:block;margin:0 0 6px;font-size:12px;color:var(--muted)}
+    input,select,button{
+      width:100%;font:inherit;color:var(--txt);background:rgba(0,0,0,.18);
+      border:1px solid rgba(255,255,255,.14);border-radius:14px;padding:10px 12px;outline:none;
+      transition:border-color .15s ease, transform .08s ease;
+    }
+    input:focus,select:focus{border-color:rgba(96,165,250,.6);box-shadow:0 0 0 4px rgba(96,165,250,.10)}
+    button{cursor:pointer;font-weight:900;letter-spacing:.2px;background:linear-gradient(180deg, rgba(96,165,250,.30), rgba(96,165,250,.16));
+      border-color:rgba(96,165,250,.45)}
+    button:hover{transform:translateY(-1px)} button:active{transform:translateY(0px)}
+    .btn2{background:rgba(0,0,0,.18);border-color:rgba(255,255,255,.14);font-weight:850}
+    .btnBad{background:linear-gradient(180deg, rgba(251,113,133,.28), rgba(251,113,133,.12));border-color:rgba(251,113,133,.45)}
+    .btnGood{background:linear-gradient(180deg, rgba(52,211,153,.25), rgba(52,211,153,.12));border-color:rgba(52,211,153,.45)}
+    .status{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:12px;border-radius:16px;border:1px solid rgba(255,255,255,.12);
+      background:rgba(0,0,0,.16);margin-bottom:12px}
+    .status .title{font-weight:950}
+    .status .sub{color:var(--muted);font-size:12px;line-height:1.35}
+    .badge{margin-left:auto;font-size:12px;padding:5px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.14);
+      color:rgba(234,240,255,.75);background:rgba(0,0,0,.12)}
+    .badge.good{border-color:rgba(52,211,153,.55);color:rgba(52,211,153,.92)}
+    .badge.warn{border-color:rgba(251,191,36,.60);color:rgba(251,191,36,.95)}
+    .badge.bad{border-color:rgba(251,113,133,.60);color:rgba(251,113,133,.95)}
+    details{border:1px solid rgba(255,255,255,.12);border-radius:16px;padding:10px 12px;background:rgba(0,0,0,.14)}
+    summary{cursor:pointer;font-weight:950;letter-spacing:.15px}
+    .muted{color:var(--muted);font-size:12.5px;line-height:1.5}
+    .toggle{display:flex;align-items:flex-start;gap:12px;padding:12px;border-radius:16px;border:1px solid rgba(255,255,255,.12);
+      background:rgba(0,0,0,.14);user-select:none;margin-top:10px}
+    .toggle input{width:auto;transform:translateY(2px) scale(1.15);accent-color:var(--accent)}
+    .jobs{display:flex;flex-direction:column;gap:10px}
+    .job{padding:12px;border-radius:16px;border:1px solid rgba(255,255,255,.12);background:rgba(0,0,0,.14);cursor:pointer;
+      transition:border-color .15s ease, transform .08s ease}
+    .job:hover{border-color:rgba(96,165,250,.55);transform:translateY(-1px)}
+    .job.active{border-color:rgba(96,165,250,.85);box-shadow:0 0 0 4px rgba(96,165,250,.10)}
+    .jobTop{display:flex;justify-content:space-between;gap:10px;align-items:center}
+    .jobTitle{font-weight:950}
+    .jobMeta{color:var(--muted);font-size:12px;margin-top:6px}
+    .mono{font-family:var(--mono)}
+    pre{margin:0;border-radius:16px;padding:12px;background:rgba(0,0,0,.22);border:1px solid rgba(255,255,255,.12);
+      overflow:auto;max-height:440px;font-size:12px;line-height:1.45}
+    .msg{margin-top:10px;padding:10px 12px;border-radius:16px;border:1px solid rgba(255,255,255,.12);
+      background:rgba(0,0,0,.14);font-size:12.5px;line-height:1.45}
+    .msg.ok{border-color:rgba(52,211,153,.38);background:rgba(52,211,153,.08);color:rgba(52,211,153,.95)}
+    .msg.err{border-color:rgba(251,113,133,.38);background:rgba(251,113,133,.08);color:rgba(251,113,133,.95)}
+    .msg.hint{border-color:rgba(251,191,36,.38);background:rgba(251,191,36,.07);color:rgba(251,191,36,.95)}
+    .actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:10px}
+    .actions>button{flex:1;min-width:220px}
+    .tiny{font-size:11.5px;color:rgba(234,240,255,.55)}
+    .hr{height:1px;background:rgba(255,255,255,.10);margin:12px 0}
   </style>
 </head>
 <body>
@@ -589,8 +562,8 @@ def home():
     <div class="brand">
       <h1>TwitchDownloader – Render Free</h1>
       <div class="sub">
-        1080p video + optional chat render. On Free, prefer 1-hour chunks to avoid storage limits.<br/>
-        Storage: <span class="mono">{DOWNLOAD_DIR}</span> • Temp: <span class="mono">{TD_TEMP_DIR}</span>
+        1080p video + optional chat render. On Free, prefer <b>1-hour chunks</b>.<br/>
+        Storage: <span class="mono">__DOWNLOAD_DIR__</span> • Temp: <span class="mono">__TD_TEMP_DIR__</span>
       </div>
     </div>
     <div class="chips">
@@ -622,9 +595,7 @@ def home():
     <section class="card">
       <div class="hd">
         <h2>Create Job</h2>
-        <div style="display:flex;gap:10px">
-          <button class="btn2" id="btnToken">Set Token</button>
-        </div>
+        <button class="btn2" id="btnToken">Set Token</button>
       </div>
       <div class="bd">
         <div class="status">
@@ -667,7 +638,7 @@ def home():
         <details style="margin-top:10px" open>
           <summary>Chunking (Begin / End)</summary>
           <div class="muted" style="margin:10px 0 12px">
-            Tip: On Render Free, use <b>1-hour chunks</b> for 1080p downloads.
+            Tip: On Render Free, use <b>1-hour chunks</b> for 1080p.
           </div>
           <div class="row">
             <div class="f">
@@ -702,7 +673,7 @@ def home():
           <input id="include_chat" type="checkbox" checked />
           <div>
             <div style="font-weight:950">Render chat + combine</div>
-            <div class="muted">Side-by-side chat panel. Chat render settings below.</div>
+            <div class="muted">Side-by-side chat panel.</div>
           </div>
         </div>
 
@@ -767,13 +738,11 @@ def home():
     <section class="card">
       <div class="hd">
         <h2>Jobs & Logs</h2>
-        <div style="display:flex;gap:10px">
-          <button class="btn2" id="btnRefresh">Refresh</button>
-        </div>
+        <button class="btn2" id="btnRefresh">Refresh</button>
       </div>
       <div class="bd">
         <div class="muted">
-          Click a job to view. Logs show the last ~300 lines. Use filter to find errors.
+          Click a job to view. Logs show the last ~300 lines.
         </div>
 
         <div class="hr"></div>
@@ -814,66 +783,64 @@ def home():
 <script>
   // ========= Token =========
   const TOKEN_KEY = "td_admin_token";
-  function getToken() {{ return localStorage.getItem(TOKEN_KEY) || ""; }}
-  function setToken(t) {{ localStorage.setItem(TOKEN_KEY, t); updateTokenBadge(); }}
-  function clearToken() {{ localStorage.removeItem(TOKEN_KEY); updateTokenBadge(); }}
+  function getToken(){ return localStorage.getItem(TOKEN_KEY) || ""; }
+  function setToken(t){ localStorage.setItem(TOKEN_KEY, t); updateTokenBadge(); }
+  function clearToken(){ localStorage.removeItem(TOKEN_KEY); updateTokenBadge(); }
 
-  function updateTokenBadge() {{
+  function updateTokenBadge(){
     const badge = document.getElementById("tokenBadge");
     const t = getToken();
     badge.textContent = t ? ("token: set (" + t.slice(0,3) + "…" + t.slice(-3) + ")") : "token: not set";
     badge.className = "badge " + (t ? "good" : "warn");
-  }}
+  }
 
-  document.getElementById("btnToken").onclick = () => {{
+  document.getElementById("btnToken").onclick = () => {
     const existing = getToken();
     const t = prompt("Enter ADMIN token (stored in this browser).", existing || "");
     if (t === null) return;
     const trimmed = t.trim();
-    if (!trimmed) {{ clearToken(); return; }}
+    if (!trimmed){ clearToken(); return; }
     setToken(trimmed);
-  }};
+  };
 
   // ========= UI =========
-  function setStatus(kind, title, sub) {{
+  function setStatus(kind, title, sub){
     const dot = document.getElementById("statusDot");
     dot.className = "dot " + (kind || "");
     document.getElementById("statusText").textContent = title || "";
     document.getElementById("statusSub").textContent = sub || "";
-  }}
-
-  function escapeHtml(s) {{
+  }
+  function escapeHtml(s){
     return (s||"").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;");
-  }}
-
-  function showMsg(text, cls) {{
+  }
+  function showMsg(text, cls){
     document.getElementById("msgArea").innerHTML =
       '<div class="msg ' + (cls||"") + '">' + text + '</div>';
-  }}
-  function clearMsg() {{ document.getElementById("msgArea").innerHTML = ""; }}
+  }
+  function clearMsg(){ document.getElementById("msgArea").innerHTML = ""; }
 
   // ========= Safe JSON read (fixes "Unexpected end of JSON input") =========
-  async function readJsonSafe(res) {{
+  async function readJsonSafe(res){
     const text = await res.text();
-    if (!text) throw new Error(`Empty response (${res.status}) - instance may have restarted/slept`);
+    if (!text) throw new Error("Empty response (" + res.status + ") - instance may have restarted/slept");
     let data;
-    try {{ data = JSON.parse(text); }}
-    catch {{ throw new Error(`Invalid JSON (${res.status}): ` + text.slice(0, 140)); }}
-    if (!res.ok) {{
-      const msg = data?.detail || data?.error || text;
+    try { data = JSON.parse(text); }
+    catch { throw new Error("Invalid JSON (" + res.status + "): " + text.slice(0,140)); }
+    if (!res.ok){
+      const msg = (data && (data.detail || data.error)) ? (data.detail || data.error) : text;
       throw new Error(msg);
-    }}
+    }
     return data;
-  }}
+  }
 
-  async function api(path, opts={{}}) {{
+  async function api(path, opts={}){
     const t = getToken();
     if (!t) throw new Error("Token not set. Click Set Token.");
-    const headers = Object.assign({{}}, opts.headers || {{}}, {{"X-Admin-Token": t}});
-    return fetch(path, Object.assign({{}}, opts, {{ headers }}));
-  }}
+    const headers = Object.assign({}, opts.headers || {}, {"X-Admin-Token": t});
+    return fetch(path, Object.assign({}, opts, { headers }));
+  }
 
-  function fmtElapsed(job) {{
+  function fmtElapsed(job){
     const s = job.started_at || 0;
     const f = job.finished_at || 0;
     if (!s) return "";
@@ -885,42 +852,41 @@ def home():
     const mm = String(m).padStart(2,"0");
     const rr = String(r).padStart(2,"0");
     return (h>0 ? (h+":"+mm+":"+rr) : (m+":"+rr));
-  }}
+  }
 
   // ========= Chunk helpers =========
-  function toSeconds(hms) {{
+  function toSeconds(hms){
     const parts = hms.split(":").map(x => parseInt(x,10));
     if (parts.length !== 3) return 0;
     return parts[0]*3600 + parts[1]*60 + parts[2];
-  }}
-  function fromSeconds(sec) {{
+  }
+  function fromSeconds(sec){
     const h = Math.floor(sec/3600);
     const m = Math.floor((sec%3600)/60);
     const s = sec%60;
     return String(h).padStart(2,"0")+":"+String(m).padStart(2,"0")+":"+String(s).padStart(2,"0");
-  }}
-  function chunkMinutes() {{
+  }
+  function chunkMinutes(){
     return parseInt(document.getElementById("chunkSize").value, 10) || 60;
-  }}
-
-  document.getElementById("btnSetStart").onclick = () => {{
+  }
+  document.getElementById("btnSetStart").onclick = () => {
     const mins = chunkMinutes();
     document.getElementById("begin").value = "00:00:00";
     document.getElementById("end").value = fromSeconds(mins*60);
-  }};
-  document.getElementById("btnNextChunk").onclick = () => {{
+  };
+  document.getElementById("btnNextChunk").onclick = () => {
     const mins = chunkMinutes();
     const b = document.getElementById("begin").value.trim() || "00:00:00";
     const e = document.getElementById("end").value.trim() || fromSeconds(mins*60);
     document.getElementById("begin").value = fromSeconds(toSeconds(b) + mins*60);
     document.getElementById("end").value = fromSeconds(toSeconds(e) + mins*60);
-  }};
+  };
 
   // ========= Chat toggle =========
   const includeChatEl = document.getElementById("include_chat");
-  function syncChatSettings() {{
+  function syncChatSettings(){
     document.getElementById("chatSettings").style.display = includeChatEl.checked ? "block" : "none";
-  }}
+  }
   includeChatEl.onchange = syncChatSettings;
   syncChatSettings();
 
@@ -928,20 +894,20 @@ def home():
   let selectedJobId = null;
   let pollTimer = null;
 
-  function badgeForStatus(st) {{
+  function badgeForStatus(st){
     if (st==="done") return "badge good";
     if (st==="error") return "badge bad";
     if (st==="running") return "badge warn";
     return "badge";
-  }}
+  }
 
-  function renderJobs(arr) {{
+  function renderJobs(arr){
     const list = document.getElementById("jobsList");
-    if (!arr || !arr.length) {{
+    if (!arr || !arr.length){
       list.innerHTML = '<div class="muted">No jobs yet.</div>';
       return;
-    }}
-    list.innerHTML = arr.map(j => {{
+    }
+    list.innerHTML = arr.map(j => {
       const active = (j.job_id === selectedJobId) ? "active" : "";
       const el = fmtElapsed(j) || "—";
       const stage = j.stage || "";
@@ -957,16 +923,16 @@ def home():
           '<div class="jobMeta mono" style="margin-top:8px">' + j.job_id + '</div>' +
         '</div>'
       );
-    }}).join("");
-  }}
+    }).join("");
+  }
 
-  async function refreshJobs() {{
+  async function refreshJobs(){
     const r = await api("/api/jobs");
     const data = await readJsonSafe(r);
     renderJobs(data.jobs || []);
-  }}
+  }
 
-  window.selectJob = async function(jobId, silent=false) {{
+  window.selectJob = async function(jobId, silent=false){
     selectedJobId = jobId;
     if (!silent) clearMsg();
 
@@ -980,9 +946,9 @@ def home():
     updateDetail(job);
     await refreshJobs();
     startPollingIfNeeded(job);
-  }}
+  }
 
-  function updateDetail(job) {{
+  function updateDetail(job){
     const st = job.status || "unknown";
     if (st === "running") setStatus("warn", "Running", "Stage: " + (job.stage||""));
     else if (st === "done") setStatus("good", "Done", "Ready to download.");
@@ -1006,35 +972,35 @@ def home():
     document.getElementById("btnDownload").disabled = (st !== "done");
     document.getElementById("btnDelete").disabled = false;
     document.getElementById("btnCancel").disabled = (st !== "running");
-  }}
+  }
 
-  function startPollingIfNeeded(job) {{
+  function startPollingIfNeeded(job){
     if (pollTimer) clearInterval(pollTimer);
-    if (job.status === "running" || job.status === "queued") {{
-      pollTimer = setInterval(async () => {{
-        try {{
+    if (job.status === "running" || job.status === "queued"){
+      pollTimer = setInterval(async () => {
+        try{
           const r = await api("/api/jobs/" + selectedJobId);
           const j = await readJsonSafe(r);
           updateDetail(j);
           await refreshJobs();
-          if (j.status !== "running" && j.status !== "queued") {{
+          if (j.status !== "running" && j.status !== "queued"){
             clearInterval(pollTimer);
             pollTimer = null;
-          }}
-        }} catch(e) {{
-          // If instance restarts, you may get empty response; ignore transient
-        }}
-      }}, 2500);
-    }}
-  }}
+          }
+        }catch(e){
+          // ignore transient (sleep/restart)
+        }
+      }, 2500);
+    }
+  }
 
   // ========= Create job =========
-  document.getElementById("btnStart").onclick = async () => {{
+  document.getElementById("btnStart").onclick = async () => {
     clearMsg();
     const vod = document.getElementById("vod").value.trim();
     if (!/^[0-9]+$/.test(vod)) return showMsg("VOD ID must be numbers only.", "err");
 
-    const payload = {{
+    const payload = {
       vod_id: vod,
       quality: document.getElementById("quality").value,
       threads: document.getElementById("threads").value.trim(),
@@ -1049,41 +1015,41 @@ def home():
       background_color: document.getElementById("bg").value.trim(),
       outline: document.getElementById("outline").value,
       crf: document.getElementById("crf").value
-    }};
+    };
 
-    try {{
-      setStatus("warn", "Queueing…", "Creating job…");
-      const r = await api("/api/jobs", {{
+    try{
+      setStatus("warn","Queueing…","Creating job…");
+      const r = await api("/api/jobs", {
         method: "POST",
-        headers: {{"Content-Type":"application/json"}},
+        headers: {"Content-Type":"application/json"},
         body: JSON.stringify(payload)
-      }});
+      });
       const data = await readJsonSafe(r);
       showMsg("Job created: <span class='mono'>" + data.job_id + "</span>", "ok");
       await refreshJobs();
       await selectJob(data.job_id);
-    }} catch (e) {{
-      setStatus("bad", "Error", e.message);
+    }catch(e){
+      setStatus("bad","Error", e.message);
       showMsg(escapeHtml(e.message), "err");
-    }}
-  }};
+    }
+  };
 
   // ========= Buttons =========
-  document.getElementById("btnCancel").onclick = async () => {{
+  document.getElementById("btnCancel").onclick = async () => {
     if (!selectedJobId) return;
-    try {{
-      await readJsonSafe(await api("/api/jobs/" + selectedJobId + "/cancel", {{ method: "POST" }}));
+    try{
+      await readJsonSafe(await api("/api/jobs/" + selectedJobId + "/cancel", {method:"POST"}));
       showMsg("Cancel requested.", "hint");
       await selectJob(selectedJobId, true);
-    }} catch(e) {{
+    }catch(e){
       showMsg("Cancel failed: " + escapeHtml(e.message), "err");
-    }}
-  }};
+    }
+  };
 
-  document.getElementById("btnDelete").onclick = async () => {{
+  document.getElementById("btnDelete").onclick = async () => {
     if (!selectedJobId) return;
-    try {{
-      await readJsonSafe(await api("/api/jobs/" + selectedJobId + "/delete", {{ method: "POST" }}));
+    try{
+      await readJsonSafe(await api("/api/jobs/" + selectedJobId + "/delete", {method:"POST"}));
       selectedJobId = null;
       document.getElementById("logBox").textContent = "Select a job to see logs.";
       document.getElementById("jobHint").innerHTML = "";
@@ -1095,107 +1061,113 @@ def home():
       showMsg("Job deleted.", "ok");
       await refreshJobs();
       setStatus("", "Idle", "Ready.");
-    }} catch(e) {{
+    }catch(e){
       showMsg("Delete failed: " + escapeHtml(e.message), "err");
-    }}
-  }};
+    }
+  };
 
-  document.getElementById("btnDownload").onclick = () => {{
+  document.getElementById("btnDownload").onclick = () => {
     if (!selectedJobId) return;
     window.location.href = "/api/jobs/" + selectedJobId + "/file";
-  }};
+  };
 
-  document.getElementById("btnCopyLog").onclick = async () => {{
+  document.getElementById("btnCopyLog").onclick = async () => {
     const t = document.getElementById("logBox").textContent;
     await navigator.clipboard.writeText(t);
     showMsg("Copied log.", "ok");
-  }};
+  };
 
-  document.getElementById("btnDownloadLog").onclick = () => {{
+  document.getElementById("btnDownloadLog").onclick = () => {
     const t = document.getElementById("logBox").textContent;
-    const blob = new Blob([t], {{type:"text/plain"}});
+    const blob = new Blob([t], {type:"text/plain"});
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
     a.download = (selectedJobId ? selectedJobId : "log") + ".txt";
     a.click();
     URL.revokeObjectURL(a.href);
-  }};
+  };
 
-  document.getElementById("btnRefresh").onclick = async () => {{
-    try {{
+  document.getElementById("btnRefresh").onclick = async () => {
+    try{
       await refreshJobs();
       showMsg("Refreshed.", "ok");
-    }} catch(e) {{
+    }catch(e){
       showMsg("Refresh failed: " + escapeHtml(e.message), "err");
-    }}
-  }};
+    }
+  };
 
-  document.getElementById("logFilter").oninput = async () => {{
+  document.getElementById("logFilter").oninput = async () => {
     if (!selectedJobId) return;
-    try {{
-      updateDetail(await readJsonSafe(await api("/api/jobs/" + selectedJobId)));
-    }} catch(e) {{}}
-  }};
+    try{
+      const j = await readJsonSafe(await api("/api/jobs/" + selectedJobId));
+      // update without re-fetching list
+      const filter = document.getElementById("logFilter").value.trim().toLowerCase();
+      const lines = (j.log || "").split("\\n");
+      const filtered = filter ? lines.filter(x => x.toLowerCase().includes(filter)) : lines;
+      document.getElementById("logBox").textContent = filtered.slice(-300).join("\\n") || "(no log yet)";
+    }catch(e){}
+  };
 
   // ========= Health + System =========
-  async function wakePing() {{
-    try {{
+  async function wakePing(){
+    try{
       const r = await fetch("/healthz");
       if (!r.ok) throw new Error();
       document.getElementById("wakeDot").className = "dot good";
       document.getElementById("wakeText").textContent = "Online";
-    }} catch(e) {{
+    }catch(e){
       document.getElementById("wakeDot").className = "dot warn";
       document.getElementById("wakeText").textContent = "Warming up…";
-    }}
-  }}
+    }
+  }
 
-  async function sysPing() {{
+  async function sysPing(){
     const dot = document.getElementById("sysDot");
     const diskText = document.getElementById("diskText");
     const queueText = document.getElementById("queueText");
-    try {{
-      if (!getToken()) {{
+    try{
+      if (!getToken()){
         dot.className = "dot warn";
         diskText.textContent = "— (set token)";
         queueText.textContent = "—";
         return;
-      }}
+      }
       const s = await readJsonSafe(await api("/api/system"));
-      const free = s.disk_download_dir?.free_mb ?? 0;
-      const total = s.disk_download_dir?.total_mb ?? 0;
+      const free = (s.disk_download_dir && s.disk_download_dir.free_mb) ? s.disk_download_dir.free_mb : 0;
+      const total = (s.disk_download_dir && s.disk_download_dir.total_mb) ? s.disk_download_dir.total_mb : 0;
       diskText.textContent = free + "MB / " + total + "MB";
-      const qsz = s.queue?.size ?? 0;
-      const qmax = s.queue?.max ?? 0;
+      const qsz = (s.queue && s.queue.size) ? s.queue.size : 0;
+      const qmax = (s.queue && s.queue.max) ? s.queue.max : 0;
       queueText.textContent = qsz + " / " + qmax;
 
       if (free < 500) dot.className = "dot bad";
       else if (free < 900) dot.className = "dot warn";
       else dot.className = "dot good";
-    }} catch(e) {{
+    }catch(e){
       dot.className = "dot warn";
       diskText.textContent = "—";
       queueText.textContent = "—";
-    }}
-  }}
+    }
+  }
 
   // Init
   updateTokenBadge();
   setStatus("", "Idle", "Ready.");
-  wakePing();
-  setInterval(wakePing, 60000);
-  sysPing();
-  setInterval(sysPing, 20000);
+  wakePing(); setInterval(wakePing, 60000);
+  sysPing(); setInterval(sysPing, 20000);
 
-  (async () => {{
-    try {{
+  (async () => {
+    try{
       if (getToken()) await refreshJobs();
-    }} catch(e) {{}}
-  }})();
+    }catch(e){}
+  })();
 </script>
 </body>
 </html>
 """
+    return HTMLResponse(
+        html.replace("__DOWNLOAD_DIR__", DOWNLOAD_DIR).replace("__TD_TEMP_DIR__", TD_TEMP_DIR)
+    )
 
 
 @app.get("/api/jobs")
@@ -1228,14 +1200,12 @@ async def create_job(req: Request):
 
     quality = str(body.get("quality", "1080p60")).strip()
 
-    # threads
     try:
         threads = int(str(body.get("threads", "2")).strip())
     except Exception:
         raise HTTPException(400, "threads must be a number")
     threads = clamp_int(threads, 1, 4)
 
-    # bandwidth
     bandwidth = None
     bw_raw = str(body.get("bandwidth", "")).strip()
     if bw_raw:
