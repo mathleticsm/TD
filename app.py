@@ -2,36 +2,45 @@ import os
 import re
 import time
 import uuid
-import json
 import shlex
+import signal
+import shutil
 import threading
 import subprocess
 from queue import Queue, Empty
 from typing import Optional, Dict, Any, List
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
-
+from fastapi.responses import HTMLResponse, FileResponse
 
 app = FastAPI()
 
-# ========= Config =========
+# =========================
+# Config (Render-friendly)
+# =========================
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
-DOWNLOAD_DIR = "/tmp/downloads"
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-MAX_QUEUE = 3                  # Render Free: keep this small
-MAX_JOBS_IN_MEMORY = 30        # how many jobs to keep in the list
-KEEP_LOG_LINES = 450           # log line cap
+# IMPORTANT: avoid Render's /tmp 2GB temp cap
+DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "/app/storage")
+TD_TEMP_DIR = os.environ.get("TD_TEMP_DIR", "/app/tdtmp")
+
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+os.makedirs(TD_TEMP_DIR, exist_ok=True)
+os.environ.setdefault("TMPDIR", TD_TEMP_DIR)
+
+MAX_QUEUE = int(os.environ.get("MAX_QUEUE", "3"))
+MAX_JOBS_IN_MEMORY = int(os.environ.get("MAX_JOBS_IN_MEMORY", "30"))
+KEEP_LOG_LINES = int(os.environ.get("KEEP_LOG_LINES", "1200"))
 
 q: "Queue[dict]" = Queue(maxsize=MAX_QUEUE)
 
-# job_id -> job dict
 jobs: Dict[str, Dict[str, Any]] = {}
-jobs_order: List[str] = []     # newest-first list
+jobs_order: List[str] = []  # newest-first
 
 
-# ========= Helpers =========
+# =========================
+# Helpers
+# =========================
 def auth(req: Request):
     if ADMIN_TOKEN and req.headers.get("X-Admin-Token") != ADMIN_TOKEN:
         raise HTTPException(401, "Missing/invalid X-Admin-Token")
@@ -45,23 +54,32 @@ def clamp_int(v: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, v))
 
 
+def disk_info(path: str) -> Dict[str, int]:
+    usage = shutil.disk_usage(path)
+    return {
+        "total_mb": usage.total // (1024 * 1024),
+        "used_mb": usage.used // (1024 * 1024),
+        "free_mb": usage.free // (1024 * 1024),
+    }
+
+
+def ensure_free_space(path: str, need_free_mb: int) -> None:
+    free_mb = disk_info(path)["free_mb"]
+    if free_mb < need_free_mb:
+        raise RuntimeError(
+            f"Not enough free disk space in {path} ({free_mb}MB free). "
+            f"Use smaller chunks (e.g., 1 hour) or lower quality."
+        )
+
+
 def normalize_optional_time(value) -> Optional[str]:
-    """
-    Accepts:
-      - None, "", "none", "null", "undefined" -> None
-      - "00:00:00" -> "00:00:00"
-    """
     if value is None:
         return None
     if isinstance(value, (int, float)):
-        # don't accept numbers as timestamps; force string input
         return None
     s = str(value).strip()
-    if s == "":
+    if s == "" or s.lower() in ("none", "null", "undefined"):
         return None
-    if s.lower() in ("none", "null", "undefined"):
-        return None
-    # simple validation: allow H:MM:SS or HH:MM:SS
     if not re.fullmatch(r"\d{1,2}:\d{2}:\d{2}", s):
         raise HTTPException(400, "beginning/ending must look like HH:MM:SS (example 02:00:00)")
     return s
@@ -71,26 +89,40 @@ def normalize_color(value: str) -> str:
     s = (value or "").strip()
     if not s:
         return "#111111"
-    # accept #RRGGBB or #AARRGGBB
     if not re.fullmatch(r"#([0-9a-fA-F]{6}|[0-9a-fA-F]{8})", s):
         raise HTTPException(400, "background_color must be like #RRGGBB or #AARRGGBB")
     return s
+
+
+def cleanup_paths(paths: List[str]) -> None:
+    for p in paths:
+        try:
+            if p and os.path.exists(p):
+                os.remove(p)
+        except Exception:
+            pass
+
+
+def cleanup_job_files(job: Dict[str, Any]) -> None:
+    paths = list(job.get("files") or [])
+    final_path = job.get("path") or ""
+    if final_path:
+        paths.append(final_path)
+    cleanup_paths(paths)
+    job["files"] = []
+    job["path"] = ""
 
 
 def add_job(job: Dict[str, Any]) -> None:
     job_id = job["job_id"]
     jobs[job_id] = job
     jobs_order.insert(0, job_id)
-    # trim
+
     while len(jobs_order) > MAX_JOBS_IN_MEMORY:
         old = jobs_order.pop()
-        try:
-            # best-effort cleanup of any file
-            path = jobs.get(old, {}).get("path") or ""
-            if path and os.path.exists(path):
-                os.remove(path)
-        except Exception:
-            pass
+        old_job = jobs.get(old)
+        if old_job:
+            cleanup_job_files(old_job)
         jobs.pop(old, None)
 
 
@@ -114,20 +146,39 @@ def hint_from_log(log: str) -> str:
     if not log:
         return ""
     if "Couldn't find a valid ICU package installed" in log or "dotnet-missing-libicu" in log:
+        return "Missing ICU. Install `libicu-dev` in Dockerfile and redeploy."
+    if "exceeded the limit of 2GB" in log or "temporary storage volume /tmp exceeded" in log.lower():
         return (
-            "Your container is missing ICU. Fix Dockerfile: add `libicu-dev` (or `libicu72`) "
-            "to apt-get install, then redeploy."
+            "You hit Render's /tmp 2GB cap. Make sure DOWNLOAD_DIR and TD_TEMP_DIR are NOT under /tmp, "
+            "and use chunks (1 hour recommended on Free)."
         )
     if "Quality not found" in log or "Unable to find requested quality" in log:
-        return (
-            "Requested quality isn't available for this VOD. Try `1080p` instead of `1080p60`, "
-            "or leave quality on Auto/Best."
-        )
+        return "That quality isn't available for this VOD. Try 1080p (not 1080p60) or Auto."
     if "429" in log or "Too Many Requests" in log:
-        return (
-            "Twitch is rate limiting you. Lower threads (2), and consider setting bandwidth."
-        )
+        return "Twitch rate-limited you. Keep threads=2 and consider bandwidth (e.g., 4000 KiB/s)."
     return ""
+
+
+def terminate_process_group(proc: subprocess.Popen) -> None:
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except Exception:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+    try:
+        proc.wait(timeout=3)
+        return
+    except Exception:
+        pass
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
 
 
 def run_and_log(job: Dict[str, Any], cmd: List[str], stage: str) -> None:
@@ -135,35 +186,58 @@ def run_and_log(job: Dict[str, Any], cmd: List[str], stage: str) -> None:
     append_log(job, f"\n=== {stage} ===")
     append_log(job, "CMD: " + " ".join(shlex.quote(x) for x in cmd))
 
-    # keep handle so we can cancel later (best-effort)
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    job["_proc_pid"] = p.pid
+    env = os.environ.copy()
+    env["TMPDIR"] = TD_TEMP_DIR
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        env=env,
+        start_new_session=True,  # create process group; allows cancel to kill children too
+    )
+    job["_proc_pid"] = proc.pid
 
     try:
-        for line in p.stdout:
-            append_log(job, line.rstrip())
-            # cancellation check (best effort)
-            if job.get("cancel_requested"):
-                try:
-                    p.terminate()
-                except Exception:
-                    pass
+        if proc.stdout:
+            for line in proc.stdout:
+                append_log(job, line.rstrip())
+                if job.get("cancel_requested"):
+                    append_log(job, "Cancel requested: terminating process group…")
+                    terminate_process_group(proc)
+                    break
+
+        rc = proc.wait()
     finally:
-        rc = p.wait()
+        try:
+            if proc.stdout:
+                proc.stdout.close()
+        except Exception:
+            pass
 
     if job.get("cancel_requested"):
         raise RuntimeError("Cancelled by user")
-
     if rc != 0:
         raise RuntimeError(f"{stage} failed (exit {rc})")
 
 
-# ========= TwitchDownloaderCLI command builders =========
-def td_videodownload(vod_id: str, out_path: str, quality: str, threads: int,
-                     bandwidth: Optional[int], beginning: Optional[str], ending: Optional[str]) -> List[str]:
+# =========================
+# TwitchDownloaderCLI builders
+# =========================
+def td_videodownload(
+    vod_id: str,
+    out_path: str,
+    quality: str,
+    threads: int,
+    bandwidth: Optional[int],
+    beginning: Optional[str],
+    ending: Optional[str],
+) -> List[str]:
     cmd = ["TwitchDownloaderCLI", "videodownload", "--id", vod_id, "-o", out_path]
     if quality:
-        cmd += ["--quality", quality]  # 1080p60/1080p/etc
+        cmd += ["--quality", quality]
     cmd += ["--threads", str(threads)]
     if bandwidth is not None:
         cmd += ["--bandwidth", str(bandwidth)]
@@ -171,13 +245,17 @@ def td_videodownload(vod_id: str, out_path: str, quality: str, threads: int,
         cmd += ["--beginning", beginning]
     if ending:
         cmd += ["--ending", ending]
-    cmd += ["--temp-path", "/tmp"]
+    cmd += ["--temp-path", TD_TEMP_DIR]
     return cmd
 
 
-def td_chatdownload(vod_id: str, out_path: str, threads: int,
-                    beginning: Optional[str], ending: Optional[str]) -> List[str]:
-    # gzip json + embed images for best render reliability
+def td_chatdownload(
+    vod_id: str,
+    out_path: str,
+    threads: int,
+    beginning: Optional[str],
+    ending: Optional[str],
+) -> List[str]:
     cmd = [
         "TwitchDownloaderCLI", "chatdownload",
         "--id", vod_id,
@@ -185,7 +263,7 @@ def td_chatdownload(vod_id: str, out_path: str, threads: int,
         "--compression", "Gzip",
         "-E",
         "--threads", str(threads),
-        "--temp-path", "/tmp",
+        "--temp-path", TD_TEMP_DIR,
     ]
     if beginning:
         cmd += ["--beginning", beginning]
@@ -194,9 +272,17 @@ def td_chatdownload(vod_id: str, out_path: str, threads: int,
     return cmd
 
 
-def td_chatrender(chat_json_path: str, out_path: str, chat_width: int, chat_height: int,
-                  font_size: int, framerate: int, update_rate: float,
-                  background_color: str, outline: bool) -> List[str]:
+def td_chatrender(
+    chat_json_path: str,
+    out_path: str,
+    chat_width: int,
+    chat_height: int,
+    font_size: int,
+    framerate: int,
+    update_rate: float,
+    background_color: str,
+    outline: bool,
+) -> List[str]:
     cmd = [
         "TwitchDownloaderCLI", "chatrender",
         "-i", chat_json_path,
@@ -207,7 +293,7 @@ def td_chatrender(chat_json_path: str, out_path: str, chat_width: int, chat_heig
         "--framerate", str(framerate),
         "--update-rate", str(update_rate),
         "--background-color", background_color,
-        "--temp-path", "/tmp",
+        "--temp-path", TD_TEMP_DIR,
         "--readable-colors", "true",
     ]
     if outline:
@@ -215,8 +301,14 @@ def td_chatrender(chat_json_path: str, out_path: str, chat_width: int, chat_heig
     return cmd
 
 
-def ffmpeg_side_by_side(video_path: str, chat_path: str, out_path: str, chat_width: int, height: int) -> List[str]:
-    # make final width = 1920 + chat_width
+def ffmpeg_side_by_side(
+    video_path: str,
+    chat_path: str,
+    out_path: str,
+    chat_width: int,
+    height: int,
+    crf: int,
+) -> List[str]:
     filter_complex = (
         f"[0:v]scale=1920:{height}:force_original_aspect_ratio=decrease,"
         f"pad=1920:{height}:(ow-iw)/2:(oh-ih)/2[vid];"
@@ -233,7 +325,8 @@ def ffmpeg_side_by_side(video_path: str, chat_path: str, out_path: str, chat_wid
         "-map", "0:a?",
         "-c:v", "libx264",
         "-preset", "veryfast",
-        "-crf", "18",
+        "-crf", str(crf),
+        "-pix_fmt", "yuv420p",
         "-c:a", "aac",
         "-b:a", "160k",
         "-movflags", "+faststart",
@@ -241,7 +334,9 @@ def ffmpeg_side_by_side(video_path: str, chat_path: str, out_path: str, chat_wid
     ]
 
 
-# ========= Worker loop =========
+# =========================
+# Worker
+# =========================
 def worker_loop():
     while True:
         try:
@@ -260,47 +355,51 @@ def worker_loop():
         job["finished_at"] = 0
         job["error"] = ""
         job["hint"] = ""
+        job["cancel_requested"] = False
 
         try:
+            # Fail fast instead of getting evicted mid-run
+            ensure_free_space(DOWNLOAD_DIR, need_free_mb=800)
+            ensure_free_space(TD_TEMP_DIR, need_free_mb=200)
+
             vod_id = payload["vod_id"]
             quality = payload["quality"]
             threads = payload["threads"]
             bandwidth = payload["bandwidth"]
             beginning = payload["beginning"]
             ending = payload["ending"]
-
             include_chat = payload["include_chat"]
 
             video_path = payload["video_path"]
             final_path = payload["final_path"]
 
-            run_and_log(job, td_videodownload(vod_id, video_path, quality, threads, bandwidth, beginning, ending),
-                        "VideoDownload")
+            run_and_log(job, td_videodownload(vod_id, video_path, quality, threads, bandwidth, beginning, ending), "VideoDownload")
 
             if include_chat:
                 chat_json = payload["chat_json"]
                 chat_mp4 = payload["chat_mp4"]
 
-                run_and_log(job, td_chatdownload(vod_id, chat_json, threads, beginning, ending),
-                            "ChatDownload")
+                run_and_log(job, td_chatdownload(vod_id, chat_json, threads, beginning, ending), "ChatDownload")
 
-                run_and_log(job, td_chatrender(
-                    chat_json, chat_mp4,
-                    payload["chat_width"], payload["chat_height"],
-                    payload["font_size"], payload["framerate"], payload["update_rate"],
-                    payload["background_color"], payload["outline"]
-                ), "ChatRender")
+                run_and_log(
+                    job,
+                    td_chatrender(
+                        chat_json, chat_mp4,
+                        payload["chat_width"], payload["chat_height"],
+                        payload["font_size"], payload["framerate"], payload["update_rate"],
+                        payload["background_color"], payload["outline"]
+                    ),
+                    "ChatRender"
+                )
 
-                run_and_log(job, ffmpeg_side_by_side(video_path, chat_mp4, final_path, payload["chat_width"], payload["chat_height"]),
-                            "Combine (Video + Chat)")
+                run_and_log(
+                    job,
+                    ffmpeg_side_by_side(video_path, chat_mp4, final_path, payload["chat_width"], payload["chat_height"], payload["crf"]),
+                    "Combine (Video + Chat)"
+                )
 
-                # cleanup intermediates (save /tmp)
-                for p in (chat_json, chat_mp4, video_path):
-                    try:
-                        if os.path.exists(p):
-                            os.remove(p)
-                    except Exception:
-                        pass
+                # cleanup intermediates ASAP
+                cleanup_paths([chat_json, chat_mp4, video_path])
             else:
                 os.replace(video_path, final_path)
 
@@ -314,6 +413,9 @@ def worker_loop():
             job["error"] = str(e)
             job["hint"] = hint_from_log(job.get("log", ""))
 
+            # cleanup intermediates on failure
+            cleanup_paths(job.get("files") or [])
+
         finally:
             job["finished_at"] = now_ts()
             job.pop("_proc_pid", None)
@@ -323,123 +425,354 @@ def worker_loop():
 threading.Thread(target=worker_loop, daemon=True).start()
 
 
-# ========= API =========
+# =========================
+# API
+# =========================
 @app.get("/healthz")
 def healthz():
     return {"ok": True, "ts": now_ts()}
 
 
+@app.get("/api/system")
+def system(req: Request):
+    auth(req)
+    return {
+        "download_dir": DOWNLOAD_DIR,
+        "temp_dir": TD_TEMP_DIR,
+        "disk_download_dir": disk_info(DOWNLOAD_DIR),
+        "disk_temp_dir": disk_info(TD_TEMP_DIR),
+        "queue": {"size": q.qsize(), "max": MAX_QUEUE},
+        "jobs_in_memory": len(jobs_order),
+        "time": now_ts(),
+    }
+
+
 @app.get("/", response_class=HTMLResponse)
 def home():
-    return """
+    return f"""
 <!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>TwitchDownloader (Render Free)</title>
+  <title>TwitchDownloader – Render Free</title>
   <style>
-    :root{
-      --bg:#0b0f19; --card:#101827; --card2:#0f172a; --text:#e5e7eb; --muted:#9ca3af;
-      --line:#243045; --accent:#60a5fa; --good:#34d399; --warn:#fbbf24; --bad:#fb7185;
-      --shadow:0 12px 35px rgba(0,0,0,.35); --r:16px;
-      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-      --sans: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji";
-    }
-    *{box-sizing:border-box}
-    body{margin:0;font-family:var(--sans);background:
-      radial-gradient(1100px 800px at 15% 10%, rgba(96,165,250,.18), transparent 55%),
-      radial-gradient(900px 700px at 85% 20%, rgba(52,211,153,.14), transparent 55%),
-      var(--bg); color:var(--text);}
-    .wrap{max-width:1150px;margin:26px auto 70px;padding:0 18px}
-    header{display:flex;justify-content:space-between;gap:14px;align-items:flex-start;margin-bottom:16px}
-    h1{margin:0;font-size:22px;letter-spacing:.2px}
-    .sub{margin-top:6px;color:var(--muted);font-size:14px;line-height:1.4}
-    .pill{display:inline-flex;align-items:center;gap:8px;padding:8px 10px;border:1px solid var(--line);
-      border-radius:999px;background:rgba(255,255,255,.04);color:var(--muted);font-size:13px}
-    .grid{display:grid;gap:14px;grid-template-columns:1fr}
-    @media(min-width:980px){.grid{grid-template-columns:1.1fr .9fr;align-items:start}}
-    .card{background:linear-gradient(180deg, rgba(255,255,255,.05), rgba(255,255,255,0)), var(--card);
-      border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--shadow);overflow:hidden}
-    .hd{padding:14px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;gap:10px;
-      background:rgba(0,0,0,.10)}
-    .hd h2{margin:0;font-size:14px;letter-spacing:.2px}
-    .bd{padding:14px}
-    .row{display:flex;gap:10px;flex-wrap:wrap}
-    .f{flex:1;min-width:220px}
-    label{display:block;font-size:12px;color:var(--muted);margin:0 0 6px}
-    input,select,button,textarea{
-      width:100%; font:inherit; color:var(--text); background:rgba(0,0,0,.14);
-      border:1px solid var(--line); border-radius:12px; padding:10px 12px; outline:none;
-    }
-    input:focus,select:focus,textarea:focus{border-color:rgba(96,165,250,.7)}
-    button{cursor:pointer;font-weight:650;background:rgba(96,165,250,.18);border-color:rgba(96,165,250,.45)}
-    button:hover{transform:translateY(-1px)} button:active{transform:translateY(0px)}
-    .btn2{background:rgba(0,0,0,.14);border-color:var(--line)}
-    .btnBad{background:rgba(251,113,133,.18);border-color:rgba(251,113,133,.45)}
-    .btnGood{background:rgba(52,211,153,.18);border-color:rgba(52,211,153,.45)}
-    .toggle{display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid var(--line);
-      border-radius:12px;background:rgba(0,0,0,.10);user-select:none}
-    .toggle input{width:auto}
-    details{border:1px solid var(--line);border-radius:12px;padding:10px 12px;background:rgba(0,0,0,.08)}
-    summary{cursor:pointer;font-weight:650}
-    .muted{color:var(--muted);font-size:13px;line-height:1.45}
-    .statusbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:10px 12px;border:1px solid var(--line);
-      border-radius:12px;background:rgba(0,0,0,.10)}
-    .dot{width:10px;height:10px;border-radius:999px;background:var(--muted)}
-    .good{background:var(--good)} .warn{background:var(--warn)} .bad{background:var(--bad)}
-    .mono{font-family:var(--mono)}
-    pre{margin:0;background:rgba(0,0,0,.22);border:1px solid var(--line);border-radius:12px;padding:12px;overflow:auto;max-height:420px}
-    .jobs{display:flex;flex-direction:column;gap:10px}
-    .job{padding:10px 12px;border:1px solid var(--line);border-radius:12px;background:rgba(0,0,0,.10);cursor:pointer}
-    .job:hover{border-color:rgba(96,165,250,.55)}
-    .jobTop{display:flex;justify-content:space-between;gap:10px;align-items:center}
-    .badge{font-size:12px;padding:3px 8px;border-radius:999px;border:1px solid var(--line);color:var(--muted)}
-    .badge.good{border-color:rgba(52,211,153,.6);color:rgba(52,211,153,.95)}
-    .badge.bad{border-color:rgba(251,113,133,.7);color:rgba(251,113,133,.95)}
-    .badge.warn{border-color:rgba(251,191,36,.75);color:rgba(251,191,36,.95)}
-    .hint{margin-top:10px;padding:10px 12px;border-radius:12px;border:1px solid rgba(251,191,36,.35);
-      background:rgba(251,191,36,.08);color:rgba(251,191,36,.95);font-size:13px;line-height:1.4}
-    .err{margin-top:10px;padding:10px 12px;border-radius:12px;border:1px solid rgba(251,113,133,.35);
-      background:rgba(251,113,133,.08);color:rgba(251,113,133,.95);font-size:13px;line-height:1.4}
-    .ok{margin-top:10px;padding:10px 12px;border-radius:12px;border:1px solid rgba(52,211,153,.35);
-      background:rgba(52,211,153,.08);color:rgba(52,211,153,.95);font-size:13px;line-height:1.4}
-    .actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:10px}
-    .actions > button{flex:1;min-width:220px}
+    :root {{
+      --bg0:#070A12;
+      --bg1:#0B1020;
+      --card:rgba(255,255,255,.06);
+      --line:rgba(255,255,255,.12);
+      --txt:#EAF0FF;
+      --muted:rgba(234,240,255,.65);
+      --good:#34d399;
+      --warn:#fbbf24;
+      --bad:#fb7185;
+      --accent:#60a5fa;
+      --accent2:#a78bfa;
+      --shadow: 0 18px 45px rgba(0,0,0,.45);
+      --r:18px;
+      --mono: ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace;
+      --sans: ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,"Apple Color Emoji","Segoe UI Emoji";
+    }}
+
+    *{{box-sizing:border-box}}
+    body {{
+      margin:0;
+      font-family:var(--sans);
+      color:var(--txt);
+      background:
+        radial-gradient(1200px 900px at 12% 8%, rgba(96,165,250,.22), transparent 55%),
+        radial-gradient(900px 700px at 88% 18%, rgba(167,139,250,.18), transparent 55%),
+        radial-gradient(1000px 700px at 50% 110%, rgba(52,211,153,.10), transparent 55%),
+        linear-gradient(180deg, var(--bg0), var(--bg1));
+      min-height:100vh;
+    }}
+
+    .wrap {{ max-width:1200px; margin:26px auto 70px; padding:0 18px; }}
+    .top {{
+      display:flex; gap:14px; align-items:flex-start; justify-content:space-between;
+      margin-bottom:14px;
+    }}
+    .brand h1 {{
+      margin:0; font-size:20px; letter-spacing:.2px; font-weight:800;
+    }}
+    .brand .sub {{
+      margin-top:6px; color:var(--muted); font-size:13px; line-height:1.45;
+    }}
+    .chips {{
+      display:flex; flex-wrap:wrap; gap:10px; justify-content:flex-end;
+    }}
+    .chip {{
+      display:flex; align-items:center; gap:10px;
+      padding:10px 12px;
+      background:var(--card);
+      border:1px solid var(--line);
+      border-radius:999px;
+      box-shadow:var(--shadow);
+      color:var(--muted);
+      font-size:12px;
+      backdrop-filter: blur(10px);
+    }}
+    .dot {{
+      width:10px; height:10px; border-radius:999px; background:rgba(255,255,255,.35);
+      box-shadow: 0 0 0 3px rgba(255,255,255,.06) inset;
+    }}
+    .dot.good{{ background:var(--good); }}
+    .dot.warn{{ background:var(--warn); }}
+    .dot.bad{{ background:var(--bad); }}
+
+    .grid {{
+      display:grid;
+      gap:14px;
+      grid-template-columns: 1fr;
+    }}
+    @media(min-width:1020px) {{
+      .grid {{ grid-template-columns: 1.08fr .92fr; align-items:start; }}
+    }}
+
+    .card {{
+      background: linear-gradient(180deg, rgba(255,255,255,.08), rgba(255,255,255,.02));
+      border:1px solid var(--line);
+      border-radius: var(--r);
+      box-shadow: var(--shadow);
+      overflow:hidden;
+      backdrop-filter: blur(10px);
+    }}
+    .hd {{
+      padding:14px 14px;
+      border-bottom:1px solid rgba(255,255,255,.10);
+      display:flex;
+      gap:10px;
+      align-items:center;
+      justify-content:space-between;
+      background: rgba(0,0,0,.14);
+    }}
+    .hd h2 {{
+      margin:0; font-size:13px; letter-spacing:.28px; text-transform:uppercase;
+      color: rgba(234,240,255,.82);
+    }}
+    .bd {{ padding:14px; }}
+
+    .row {{ display:flex; gap:10px; flex-wrap:wrap; }}
+    .f {{ flex:1; min-width:220px; }}
+    label {{ display:block; margin:0 0 6px; font-size:12px; color:var(--muted); }}
+
+    input, select, button, textarea {{
+      width:100%;
+      font:inherit;
+      color:var(--txt);
+      background: rgba(0,0,0,.18);
+      border:1px solid rgba(255,255,255,.14);
+      border-radius: 14px;
+      padding:10px 12px;
+      outline:none;
+      transition: border-color .15s ease, transform .08s ease;
+    }}
+    input:focus, select:focus, textarea:focus {{
+      border-color: rgba(96,165,250,.6);
+      box-shadow: 0 0 0 4px rgba(96,165,250,.10);
+    }}
+
+    button {{
+      cursor:pointer;
+      font-weight:800;
+      letter-spacing:.2px;
+      background: linear-gradient(180deg, rgba(96,165,250,.30), rgba(96,165,250,.16));
+      border-color: rgba(96,165,250,.45);
+    }}
+    button:hover {{ transform: translateY(-1px); }}
+    button:active {{ transform: translateY(0px); }}
+
+    .btn2 {{
+      background: rgba(0,0,0,.18);
+      border-color: rgba(255,255,255,.14);
+      font-weight:750;
+    }}
+    .btnBad {{
+      background: linear-gradient(180deg, rgba(251,113,133,.28), rgba(251,113,133,.12));
+      border-color: rgba(251,113,133,.45);
+    }}
+    .btnGood {{
+      background: linear-gradient(180deg, rgba(52,211,153,.25), rgba(52,211,153,.12));
+      border-color: rgba(52,211,153,.45);
+    }}
+
+    .status {{
+      display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+      padding:12px;
+      border-radius: 16px;
+      border:1px solid rgba(255,255,255,.12);
+      background: rgba(0,0,0,.16);
+      margin-bottom: 12px;
+    }}
+    .status .title {{ font-weight:900; }}
+    .status .sub {{ color:var(--muted); font-size:12px; line-height:1.35; }}
+    .badge {{
+      margin-left:auto;
+      font-size:12px;
+      padding:5px 10px;
+      border-radius:999px;
+      border:1px solid rgba(255,255,255,.14);
+      color: rgba(234,240,255,.75);
+      background: rgba(0,0,0,.12);
+    }}
+    .badge.good{{ border-color: rgba(52,211,153,.55); color: rgba(52,211,153,.92); }}
+    .badge.warn{{ border-color: rgba(251,191,36,.60); color: rgba(251,191,36,.95); }}
+    .badge.bad{{ border-color: rgba(251,113,133,.60); color: rgba(251,113,133,.95); }}
+
+    details {{
+      border:1px solid rgba(255,255,255,.12);
+      border-radius: 16px;
+      padding: 10px 12px;
+      background: rgba(0,0,0,.14);
+    }}
+    summary {{
+      cursor:pointer;
+      font-weight:900;
+      letter-spacing:.15px;
+    }}
+    .muted {{ color:var(--muted); font-size:12.5px; line-height:1.5; }}
+
+    .toggle {{
+      display:flex; align-items:flex-start; gap:12px;
+      padding: 12px;
+      border-radius: 16px;
+      border:1px solid rgba(255,255,255,.12);
+      background: rgba(0,0,0,.14);
+      user-select:none;
+      margin-top:10px;
+    }}
+    .toggle input {{
+      width:auto;
+      transform: translateY(2px) scale(1.15);
+      accent-color: var(--accent);
+    }}
+
+    .jobs {{ display:flex; flex-direction:column; gap:10px; }}
+    .job {{
+      padding: 12px;
+      border-radius: 16px;
+      border:1px solid rgba(255,255,255,.12);
+      background: rgba(0,0,0,.14);
+      cursor:pointer;
+      transition: border-color .15s ease, transform .08s ease;
+    }}
+    .job:hover {{ border-color: rgba(96,165,250,.55); transform: translateY(-1px); }}
+    .job.active {{ border-color: rgba(96,165,250,.85); box-shadow: 0 0 0 4px rgba(96,165,250,.10); }}
+    .jobTop {{ display:flex; justify-content:space-between; gap:10px; align-items:center; }}
+    .jobTitle {{ font-weight:950; }}
+    .jobMeta {{ color:var(--muted); font-size:12px; margin-top:6px; }}
+    .mono {{ font-family: var(--mono); }}
+    pre {{
+      margin:0;
+      border-radius: 16px;
+      padding: 12px;
+      background: rgba(0,0,0,.22);
+      border:1px solid rgba(255,255,255,.12);
+      overflow:auto;
+      max-height: 440px;
+      font-size: 12px;
+      line-height: 1.45;
+    }}
+
+    .msg {{
+      margin-top: 10px;
+      padding: 10px 12px;
+      border-radius: 16px;
+      border:1px solid rgba(255,255,255,.12);
+      background: rgba(0,0,0,.14);
+      font-size: 12.5px;
+      line-height: 1.45;
+    }}
+    .msg.ok {{
+      border-color: rgba(52,211,153,.38);
+      background: rgba(52,211,153,.08);
+      color: rgba(52,211,153,.95);
+    }}
+    .msg.err {{
+      border-color: rgba(251,113,133,.38);
+      background: rgba(251,113,133,.08);
+      color: rgba(251,113,133,.95);
+    }}
+    .msg.hint {{
+      border-color: rgba(251,191,36,.38);
+      background: rgba(251,191,36,.07);
+      color: rgba(251,191,36,.95);
+    }}
+
+    .actions {{
+      display:flex;
+      gap:10px;
+      flex-wrap:wrap;
+      margin-top: 10px;
+    }}
+    .actions > button {{ flex:1; min-width:220px; }}
+
+    .tiny {{
+      font-size: 11.5px;
+      color: rgba(234,240,255,.55);
+    }}
+    .hr {{
+      height:1px;
+      background: rgba(255,255,255,.10);
+      margin: 12px 0;
+    }}
   </style>
 </head>
 <body>
 <div class="wrap">
-  <header>
-    <div>
-      <h1>TwitchDownloader (Render Free)</h1>
+  <div class="top">
+    <div class="brand">
+      <h1>TwitchDownloader – Render Free</h1>
       <div class="sub">
-        1080p video + optional chat render. For long VODs, use 2-hour chunks (Begin/End).<br/>
-        Free services can sleep; this page sends keep-alive pings automatically.
+        1080p video + optional chat render. For long VODs, use chunks (1h recommended on Free).<br/>
+        Storage dirs: <span class="mono">{DOWNLOAD_DIR}</span> • temp: <span class="mono">{TD_TEMP_DIR}</span>
       </div>
     </div>
-    <div class="pill">
-      <span id="wakeDot" class="dot warn"></span>
-      <span id="wakeText">Warming up…</span>
+
+    <div class="chips">
+      <div class="chip">
+        <span id="wakeDot" class="dot warn"></span>
+        <div>
+          <div style="font-weight:900;color:rgba(234,240,255,.85)">Service</div>
+          <div class="tiny" id="wakeText">Warming up…</div>
+        </div>
+      </div>
+      <div class="chip">
+        <span id="sysDot" class="dot warn"></span>
+        <div>
+          <div style="font-weight:900;color:rgba(234,240,255,.85)">Disk Free</div>
+          <div class="tiny" id="diskText">—</div>
+        </div>
+      </div>
+      <div class="chip">
+        <span class="dot" style="background:rgba(255,255,255,.35)"></span>
+        <div>
+          <div style="font-weight:900;color:rgba(234,240,255,.85)">Queue</div>
+          <div class="tiny" id="queueText">—</div>
+        </div>
+      </div>
     </div>
-  </header>
+  </div>
 
   <div class="grid">
-    <!-- Left: New Job -->
+    <!-- Left -->
     <section class="card">
       <div class="hd">
-        <h2>New Job</h2>
-        <button class="btn2" id="btnToken">Set Token</button>
+        <h2>Create Job</h2>
+        <div style="display:flex;gap:10px">
+          <button class="btn2" id="btnToken">Set Token</button>
+        </div>
       </div>
       <div class="bd">
 
-        <div class="statusbar" style="margin-bottom:12px">
+        <div class="status">
           <span id="statusDot" class="dot"></span>
           <div style="flex:1">
-            <div id="statusText" style="font-weight:650">Idle</div>
-            <div class="muted" id="statusSub">Ready.</div>
+            <div class="title" id="statusText">Idle</div>
+            <div class="sub" id="statusSub">Ready.</div>
           </div>
-          <div class="badge" id="tokenBadge">token: not set</div>
+          <div class="badge warn" id="tokenBadge">token: not set</div>
         </div>
 
         <div class="row">
@@ -461,7 +794,7 @@ def home():
 
         <div class="row">
           <div class="f">
-            <label>Threads (Render Free recommended: 2)</label>
+            <label>Threads (recommended: 2)</label>
             <input id="threads" value="2" />
           </div>
           <div class="f">
@@ -470,10 +803,10 @@ def home():
           </div>
         </div>
 
-        <details style="margin-top:10px">
+        <details style="margin-top:10px" open>
           <summary>Chunking (Begin / End)</summary>
           <div class="muted" style="margin:10px 0 12px">
-            Use chunks for 3–6 hour VODs (ex: 00:00:00 → 02:00:00). Leave blank for full VOD.
+            Tip: On Render Free, use <b>1-hour chunks</b> for 1080p to avoid storage limits.
           </div>
           <div class="row">
             <div class="f">
@@ -482,29 +815,42 @@ def home():
             </div>
             <div class="f">
               <label>End (HH:MM:SS)</label>
-              <input id="end" placeholder="02:00:00" />
+              <input id="end" placeholder="01:00:00" />
             </div>
           </div>
-          <div class="actions">
-            <button class="btn2" id="btnSet2h">Set 0→2h</button>
-            <button class="btn2" id="btnNext2h">Next 2h Chunk</button>
+          <div class="row" style="margin-top:10px">
+            <div class="f">
+              <label>Chunk size</label>
+              <select id="chunkSize">
+                <option value="60" selected>1 hour (recommended)</option>
+                <option value="90">1h 30m</option>
+                <option value="120">2 hours</option>
+              </select>
+            </div>
+            <div class="f">
+              <label>Quick actions</label>
+              <div class="row">
+                <button class="btn2" id="btnSetStart">Set 0 → chunk</button>
+                <button class="btn2" id="btnNextChunk">Next chunk</button>
+              </div>
+            </div>
           </div>
         </details>
 
-        <div class="toggle" style="margin-top:10px">
+        <div class="toggle">
           <input id="include_chat" type="checkbox" checked />
           <div>
-            <div style="font-weight:650">Render chat + combine</div>
-            <div class="muted">Side-by-side chat panel (most reliable on Free).</div>
+            <div style="font-weight:950">Render chat + combine</div>
+            <div class="muted">Side-by-side chat panel. Chat render settings below.</div>
           </div>
         </div>
 
         <details style="margin-top:10px" id="chatSettings">
-          <summary>Chat render settings</summary>
+          <summary>Chat render settings (smaller defaults)</summary>
           <div class="row" style="margin-top:10px">
             <div class="f">
               <label>Chat width (px)</label>
-              <input id="chat_width" value="422" />
+              <input id="chat_width" value="420" />
             </div>
             <div class="f">
               <label>Font size</label>
@@ -514,11 +860,11 @@ def home():
           <div class="row">
             <div class="f">
               <label>Framerate</label>
-              <input id="framerate" value="30" />
+              <input id="framerate" value="24" />
             </div>
             <div class="f">
               <label>Update rate (seconds)</label>
-              <input id="update_rate" value="0.2" />
+              <input id="update_rate" value="0.25" />
             </div>
           </div>
           <div class="row">
@@ -534,6 +880,22 @@ def home():
               </select>
             </div>
           </div>
+
+          <div class="row" style="margin-top:10px">
+            <div class="f">
+              <label>Final encode size (CRF)</label>
+              <select id="crf">
+                <option value="23" selected>23 (smaller – recommended)</option>
+                <option value="21">21 (bigger)</option>
+                <option value="18">18 (very big)</option>
+              </select>
+              <div class="tiny" style="margin-top:6px">Lower CRF = higher quality + bigger files.</div>
+            </div>
+            <div class="f">
+              <label>Preset</label>
+              <div class="tiny" style="margin-top:10px">Using ffmpeg preset: <span class="mono">veryfast</span></div>
+            </div>
+          </div>
         </details>
 
         <div class="actions">
@@ -542,89 +904,115 @@ def home():
         </div>
 
         <div id="msgArea"></div>
+
       </div>
     </section>
 
-    <!-- Right: Jobs + Log -->
+    <!-- Right -->
     <section class="card">
       <div class="hd">
-        <h2>Jobs</h2>
-        <div class="inline" style="display:flex;gap:10px">
+        <h2>Jobs & Logs</h2>
+        <div style="display:flex;gap:10px">
           <button class="btn2" id="btnRefresh">Refresh</button>
-          <button class="btn2" id="btnClearLocal">Clear Local History</button>
+          <button class="btn2" id="btnClearToken">Clear Token</button>
         </div>
       </div>
       <div class="bd">
-        <div class="muted" style="margin-bottom:10px">
-          Click a job to view details. Logs show the most recent lines.
+        <div class="muted">
+          Click a job to view. Logs show the last ~300 lines. Use the filter to find errors.
         </div>
+
+        <div class="hr"></div>
 
         <div class="jobs" id="jobsList"></div>
 
-        <div style="margin-top:12px">
-          <div class="row">
-            <div class="f">
-              <label>Log filter (optional)</label>
-              <input id="logFilter" placeholder="type to filter lines…" />
-            </div>
-            <div class="f">
-              <label>Actions</label>
-              <div class="row">
-                <button class="btn2" id="btnCopyLog">Copy Log</button>
-                <button class="btn2" id="btnDownloadLog">Download Log</button>
-              </div>
-            </div>
+        <div class="hr"></div>
+
+        <div class="row">
+          <div class="f">
+            <label>Log filter</label>
+            <input id="logFilter" placeholder="type to filter log lines…" />
           </div>
-          <pre id="logBox" class="mono">Select a job to see logs.</pre>
-          <div id="jobHint"></div>
-          <div id="jobError"></div>
-          <div id="jobOk"></div>
-          <div class="actions">
-            <button class="btn2" id="btnDownload" disabled>Download MP4</button>
-            <button class="btn2" id="btnDelete" disabled>Delete Job</button>
+          <div class="f">
+            <label>Log actions</label>
+            <div class="row">
+              <button class="btn2" id="btnCopyLog">Copy</button>
+              <button class="btn2" id="btnDownloadLog">Download</button>
+            </div>
           </div>
         </div>
 
+        <div style="margin-top:10px">
+          <pre id="logBox" class="mono">Select a job to see logs.</pre>
+        </div>
+
+        <div id="jobHint"></div>
+        <div id="jobError"></div>
+        <div id="jobOk"></div>
+
+        <div class="actions">
+          <button class="btn2" id="btnDownload" disabled>Download MP4</button>
+          <button class="btn2" id="btnDelete" disabled>Delete Job</button>
+        </div>
       </div>
     </section>
+
   </div>
 </div>
 
 <script>
-  // ===== Token handling =====
+  // ========= Token =========
   const TOKEN_KEY = "td_admin_token";
-  function getToken(){ return localStorage.getItem(TOKEN_KEY) || ""; }
-  function setToken(t){ localStorage.setItem(TOKEN_KEY, t); updateTokenBadge(); }
-  function clearToken(){ localStorage.removeItem(TOKEN_KEY); updateTokenBadge(); }
+  function getToken() {{ return localStorage.getItem(TOKEN_KEY) || ""; }}
+  function setToken(t) {{ localStorage.setItem(TOKEN_KEY, t); updateTokenBadge(); }}
+  function clearToken() {{ localStorage.removeItem(TOKEN_KEY); updateTokenBadge(); }}
 
-  function updateTokenBadge(){
+  function updateTokenBadge() {{
     const badge = document.getElementById("tokenBadge");
     const t = getToken();
     badge.textContent = t ? ("token: set (" + t.slice(0,3) + "…" + t.slice(-3) + ")") : "token: not set";
     badge.className = "badge " + (t ? "good" : "warn");
-  }
+  }}
 
-  document.getElementById("btnToken").onclick = () => {
+  document.getElementById("btnToken").onclick = () => {{
     const existing = getToken();
     const t = prompt("Enter ADMIN token (stored in this browser).", existing || "");
-    if(t === null) return;
+    if (t === null) return;
     const trimmed = t.trim();
-    if(!trimmed){ clearToken(); return; }
+    if (!trimmed) {{ clearToken(); return; }}
     setToken(trimmed);
-  };
+  }};
 
-  // ===== UI helpers =====
-  function setStatus(kind, title, sub){
+  document.getElementById("btnClearToken").onclick = () => {{
+    if (confirm("Clear saved token from this browser?")) {{
+      clearToken();
+      showMsg("Token cleared.", "hint");
+    }}
+  }};
+
+  // ========= UI helpers =========
+  function setStatus(kind, title, sub) {{
     const dot = document.getElementById("statusDot");
     dot.className = "dot " + (kind || "");
     document.getElementById("statusText").textContent = title || "";
     document.getElementById("statusSub").textContent = sub || "";
-  }
+  }}
 
-  function fmtElapsed(job){
+  function showMsg(text, cls) {{
+    const m = document.getElementById("msgArea");
+    m.innerHTML = '<div class="msg ' + (cls||"") + '">' + text + '</div>';
+  }}
+
+  function clearMsg() {{ document.getElementById("msgArea").innerHTML = ""; }}
+
+  function escapeHtml(s) {{
+    return (s||"").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;");
+  }}
+
+  function fmtElapsed(job) {{
     const s = job.started_at || 0;
     const f = job.finished_at || 0;
-    if(!s) return "";
+    if (!s) return "";
     const end = f ? f : Math.floor(Date.now()/1000);
     const sec = Math.max(0, end - s);
     const h = Math.floor(sec/3600);
@@ -633,200 +1021,171 @@ def home():
     const mm = String(m).padStart(2,"0");
     const rr = String(r).padStart(2,"0");
     return (h>0 ? (h+":"+mm+":"+rr) : (m+":"+rr));
-  }
+  }}
 
-  function safeJsonParse(t){
-    try { return JSON.parse(t); } catch(e){ return null; }
-  }
-
-  function showMsg(html, cls){
-    const m = document.getElementById("msgArea");
-    m.innerHTML = '<div class="'+cls+'">'+html+'</div>';
-  }
-  function clearMsg(){ document.getElementById("msgArea").innerHTML = ""; }
-
-  // ===== Chunk helper =====
-  function toSeconds(hms){
-    const parts = hms.split(":").map(x=>parseInt(x,10));
-    if(parts.length!==3) return 0;
+  // ========= Chunk helpers =========
+  function toSeconds(hms) {{
+    const parts = hms.split(":").map(x => parseInt(x,10));
+    if (parts.length !== 3) return 0;
     return parts[0]*3600 + parts[1]*60 + parts[2];
-  }
-  function fromSeconds(sec){
+  }}
+  function fromSeconds(sec) {{
     const h = Math.floor(sec/3600);
     const m = Math.floor((sec%3600)/60);
     const s = sec%60;
     return String(h).padStart(2,"0")+":"+String(m).padStart(2,"0")+":"+String(s).padStart(2,"0");
-  }
-  document.getElementById("btnSet2h").onclick = () => {
+  }}
+  function chunkMinutes() {{
+    return parseInt(document.getElementById("chunkSize").value, 10) || 60;
+  }}
+
+  document.getElementById("btnSetStart").onclick = () => {{
+    const mins = chunkMinutes();
     document.getElementById("begin").value = "00:00:00";
-    document.getElementById("end").value = "02:00:00";
-  };
-  document.getElementById("btnNext2h").onclick = () => {
+    document.getElementById("end").value = fromSeconds(mins*60);
+  }};
+  document.getElementById("btnNextChunk").onclick = () => {{
+    const mins = chunkMinutes();
     const b = document.getElementById("begin").value.trim() || "00:00:00";
-    const e = document.getElementById("end").value.trim() || "02:00:00";
-    const b2 = toSeconds(b) + 2*3600;
-    const e2 = toSeconds(e) + 2*3600;
+    const e = document.getElementById("end").value.trim() || fromSeconds(mins*60);
+    const b2 = toSeconds(b) + mins*60;
+    const e2 = toSeconds(e) + mins*60;
     document.getElementById("begin").value = fromSeconds(b2);
     document.getElementById("end").value = fromSeconds(e2);
-  };
+  }};
 
-  // Enable/disable chat settings UI
+  // ========= Chat toggle =========
   const includeChatEl = document.getElementById("include_chat");
-  function syncChatSettings(){
+  function syncChatSettings() {{
     document.getElementById("chatSettings").style.display = includeChatEl.checked ? "block" : "none";
-  }
+  }}
   includeChatEl.onchange = syncChatSettings;
   syncChatSettings();
 
-  // ===== Jobs list =====
+  // ========= API =========
+  async function api(path, opts={{}}) {{
+    const t = getToken();
+    if (!t) throw new Error("Token not set. Click Set Token.");
+    const headers = Object.assign({{}}, opts.headers || {{}}, {{"X-Admin-Token": t}});
+    return fetch(path, Object.assign({{}}, opts, {{ headers }}));
+  }}
+
+  // ========= Jobs =========
   let selectedJobId = null;
   let pollTimer = null;
 
-  async function api(path, opts={}){
-    const t = getToken();
-    if(!t){
-      throw new Error("Token not set. Click “Set Token”.");
-    }
-    const headers = Object.assign({}, opts.headers || {}, {"X-Admin-Token": t});
-    return fetch(path, Object.assign({}, opts, {headers}));
-  }
-
-  function badgeForStatus(st){
-    if(st==="done") return "badge good";
-    if(st==="error") return "badge bad";
-    if(st==="running") return "badge warn";
+  function badgeForStatus(st) {{
+    if (st==="done") return "badge good";
+    if (st==="error") return "badge bad";
+    if (st==="running") return "badge warn";
     return "badge";
-  }
+  }}
 
-  function renderJobs(jobs){
+  function renderJobs(arr) {{
     const list = document.getElementById("jobsList");
-    if(!jobs.length){
+    if (!arr || !arr.length) {{
       list.innerHTML = '<div class="muted">No jobs yet.</div>';
       return;
-    }
-    list.innerHTML = jobs.map(j => {
-      const active = (j.job_id === selectedJobId) ? 'style="border-color: rgba(96,165,250,.75)"' : "";
-      const el = fmtElapsed(j);
-      return `
-        <div class="job" ${active} onclick="selectJob('${j.job_id}')">
-          <div class="jobTop">
-            <div>
-              <div style="font-weight:650">VOD ${j.vod_id}</div>
-              <div class="muted">Stage: ${j.stage || ""} • Elapsed: ${el || "—"}</div>
-            </div>
-            <div class="${badgeForStatus(j.status)}">${j.status}</div>
-          </div>
-          <div class="muted mono" style="margin-top:8px;font-size:12px;opacity:.9">
-            ${j.job_id}
-          </div>
-        </div>
-      `;
-    }).join("");
-  }
+    }}
+    list.innerHTML = arr.map(j => {{
+      const active = (j.job_id === selectedJobId) ? "active" : "";
+      const el = fmtElapsed(j) || "—";
+      const stage = j.stage || "";
+      return (
+        '<div class="job ' + active + '" onclick="selectJob(\\'' + j.job_id + '\\')">' +
+          '<div class="jobTop">' +
+            '<div>' +
+              '<div class="jobTitle">VOD ' + j.vod_id + '</div>' +
+              '<div class="jobMeta">Stage: ' + stage + ' • Elapsed: ' + el + '</div>' +
+            '</div>' +
+            '<div class="' + badgeForStatus(j.status) + '">' + j.status + '</div>' +
+          '</div>' +
+          '<div class="jobMeta mono" style="margin-top:8px">' + j.job_id + '</div>' +
+        '</div>'
+      );
+    }}).join("");
+  }}
 
-  async function refreshJobs(){
-    try{
-      const r = await api("/api/jobs");
-      const data = await r.json();
-      renderJobs(data.jobs || []);
-      // keep selected job highlighted
-      if(selectedJobId){
-        // re-select to refresh details
-        await selectJob(selectedJobId, true);
-      }
-    }catch(e){
-      renderJobs([]);
-      setStatus("bad","Auth / API error", e.message);
-      showMsg(e.message, "err");
-    }
-  }
+  async function refreshJobs() {{
+    const r = await api("/api/jobs");
+    const data = await r.json();
+    renderJobs(data.jobs || []);
+    if (selectedJobId) await selectJob(selectedJobId, true);
+  }}
 
-  window.selectJob = async function(jobId, silent=false){
+  window.selectJob = async function(jobId, silent=false) {{
     selectedJobId = jobId;
-    if(!silent) clearMsg();
-
+    if (!silent) clearMsg();
     document.getElementById("btnDownload").disabled = true;
     document.getElementById("btnDelete").disabled = true;
+    document.getElementById("btnCancel").disabled = true;
 
-    try{
-      const r = await api("/api/jobs/" + jobId);
-      const job = await r.json();
-      updateDetail(job);
-      renderJobs((await (await api("/api/jobs")).json()).jobs || []);
-      startPollingIfNeeded(job);
-    }catch(e){
-      if(!silent) showMsg(e.message, "err");
-    }
-  }
+    const r = await api("/api/jobs/" + jobId);
+    const job = await r.json();
 
-  function updateDetail(job){
-    // Status header left side
+    updateDetail(job);
+    await refreshJobs();
+
+    startPollingIfNeeded(job);
+  }}
+
+  function updateDetail(job) {{
     const st = job.status || "unknown";
-    if(st==="running") setStatus("warn","Running", "Stage: " + (job.stage||""));
-    else if(st==="done") setStatus("good","Done", "Ready to download.");
-    else if(st==="error") setStatus("bad","Error", job.error || "Failed.");
+    if (st === "running") setStatus("warn", "Running", "Stage: " + (job.stage||""));
+    else if (st === "done") setStatus("good", "Done", "Ready to download.");
+    else if (st === "error") setStatus("bad", "Error", job.error || "Failed.");
     else setStatus("", "Idle", "Ready.");
 
-    // log display with filter
     const filter = document.getElementById("logFilter").value.trim().toLowerCase();
     const lines = (job.log || "").split("\\n");
     const filtered = filter ? lines.filter(x => x.toLowerCase().includes(filter)) : lines;
-    const tail = filtered.slice(-220).join("\\n");
+    const tail = filtered.slice(-300).join("\\n");
     document.getElementById("logBox").textContent = tail || "(no log yet)";
 
-    // hint + error boxes
     const hint = job.hint || "";
-    document.getElementById("jobHint").innerHTML = hint ? '<div class="hint"><b>Hint:</b> ' + hint + '</div>' : "";
-    document.getElementById("jobError").innerHTML = (st==="error" && job.error) ? '<div class="err"><b>Error:</b> ' + escapeHtml(job.error) + '</div>' : "";
-    document.getElementById("jobOk").innerHTML = (st==="done") ? '<div class="ok"><b>Done:</b> Click Download MP4.</div>' : "";
+    document.getElementById("jobHint").innerHTML = hint ? '<div class="msg hint"><b>Hint:</b> ' + escapeHtml(hint) + '</div>' : "";
+    document.getElementById("jobError").innerHTML = (st==="error" && job.error) ? '<div class="msg err"><b>Error:</b> ' + escapeHtml(job.error) + '</div>' : "";
+    document.getElementById("jobOk").innerHTML = (st==="done") ? '<div class="msg ok"><b>Done:</b> Click Download MP4.</div>' : "";
 
-    // buttons
-    document.getElementById("btnDownload").disabled = (st!=="done");
+    document.getElementById("btnDownload").disabled = (st !== "done");
     document.getElementById("btnDelete").disabled = false;
+    document.getElementById("btnCancel").disabled = (st !== "running");
+  }}
 
-    // cancel button only if running
-    document.getElementById("btnCancel").disabled = (st!=="running");
-  }
-
-  function escapeHtml(s){
-    return (s||"").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;");
-  }
-
-  function startPollingIfNeeded(job){
-    if(pollTimer) clearInterval(pollTimer);
-    if(job.status === "running" || job.status === "queued"){
-      pollTimer = setInterval(async () => {
-        try{
+  function startPollingIfNeeded(job) {{
+    if (pollTimer) clearInterval(pollTimer);
+    if (job.status === "running" || job.status === "queued") {{
+      pollTimer = setInterval(async () => {{
+        try {{
           const r = await api("/api/jobs/" + selectedJobId);
           const j = await r.json();
           updateDetail(j);
-          // refresh list to show new status/elapsed
           const listData = await (await api("/api/jobs")).json();
           renderJobs(listData.jobs || []);
-          if(j.status !== "running" && j.status !== "queued"){
+          if (j.status !== "running" && j.status !== "queued") {{
             clearInterval(pollTimer);
             pollTimer = null;
-          }
-        }catch(e){
+          }}
+        }} catch(e) {{
           // ignore transient
-        }
-      }, 2500);
-    }
-  }
+        }}
+      }}, 2500);
+    }}
+  }}
 
-  // ===== Start job =====
-  document.getElementById("btnStart").onclick = async () => {
+  // ========= Create job =========
+  document.getElementById("btnStart").onclick = async () => {{
     clearMsg();
     const vod = document.getElementById("vod").value.trim();
-    if(!/^[0-9]+$/.test(vod)) return showMsg("VOD ID must be numbers only.", "err");
+    if (!/^[0-9]+$/.test(vod)) return showMsg("VOD ID must be numbers only.", "err");
 
-    const payload = {
+    const payload = {{
       vod_id: vod,
       quality: document.getElementById("quality").value,
       threads: document.getElementById("threads").value.trim(),
       bandwidth: document.getElementById("bandwidth").value.trim(),
-      beginning: document.getElementById("begin").value.trim(), // send "" not null
-      ending: document.getElementById("end").value.trim(),      // send "" not null
+      beginning: document.getElementById("begin").value.trim(),
+      ending: document.getElementById("end").value.trim(),
       include_chat: document.getElementById("include_chat").checked,
 
       chat_width: document.getElementById("chat_width").value.trim(),
@@ -834,50 +1193,53 @@ def home():
       framerate: document.getElementById("framerate").value.trim(),
       update_rate: document.getElementById("update_rate").value.trim(),
       background_color: document.getElementById("bg").value.trim(),
-      outline: document.getElementById("outline").value
-    };
+      outline: document.getElementById("outline").value,
+      crf: document.getElementById("crf").value
+    }};
 
-    try{
-      setStatus("warn","Queueing…","Creating job…");
-      const r = await api("/api/jobs", {
+    try {{
+      setStatus("warn", "Queueing…", "Creating job…");
+      const r = await api("/api/jobs", {{
         method: "POST",
-        headers: {"Content-Type":"application/json"},
+        headers: {{"Content-Type":"application/json"}},
         body: JSON.stringify(payload)
-      });
+      }});
       const txt = await r.text();
-      if(!r.ok){
-        const maybe = safeJsonParse(txt);
-        const msg = maybe?.detail || txt;
-        setStatus("bad","Error", msg);
-        return showMsg(msg, "err");
-      }
+      if (!r.ok) {{
+        let msg = txt;
+        try {{
+          const j = JSON.parse(txt);
+          msg = j.detail || txt;
+        }} catch(_) {{}}
+        setStatus("bad", "Error", msg);
+        return showMsg(escapeHtml(msg), "err");
+      }}
       const data = JSON.parse(txt);
       showMsg("Job created: <span class='mono'>" + data.job_id + "</span>", "ok");
       await refreshJobs();
       await selectJob(data.job_id);
-    }catch(e){
-      setStatus("bad","Error", e.message);
-      showMsg(e.message, "err");
-    }
-  };
+    }} catch (e) {{
+      setStatus("bad", "Error", e.message);
+      showMsg(escapeHtml(e.message), "err");
+    }}
+  }};
 
-  // ===== Cancel/Delete/Download/Log actions =====
-  document.getElementById("btnCancel").onclick = async () => {
-    if(!selectedJobId) return;
-    try{
-      const r = await api("/api/jobs/" + selectedJobId + "/cancel", {method:"POST"});
-      const data = await r.json();
+  // ========= Actions =========
+  document.getElementById("btnCancel").onclick = async () => {{
+    if (!selectedJobId) return;
+    try {{
+      await api("/api/jobs/" + selectedJobId + "/cancel", {{ method: "POST" }});
       showMsg("Cancel requested.", "hint");
-      await selectJob(selectedJobId);
-    }catch(e){
-      showMsg("Cancel failed: " + e.message, "err");
-    }
-  };
+      await selectJob(selectedJobId, true);
+    }} catch(e) {{
+      showMsg("Cancel failed: " + escapeHtml(e.message), "err");
+    }}
+  }};
 
-  document.getElementById("btnDelete").onclick = async () => {
-    if(!selectedJobId) return;
-    try{
-      await api("/api/jobs/" + selectedJobId + "/delete", {method:"POST"});
+  document.getElementById("btnDelete").onclick = async () => {{
+    if (!selectedJobId) return;
+    try {{
+      await api("/api/jobs/" + selectedJobId + "/delete", {{ method: "POST" }});
       selectedJobId = null;
       document.getElementById("logBox").textContent = "Select a job to see logs.";
       document.getElementById("jobHint").innerHTML = "";
@@ -885,70 +1247,116 @@ def home():
       document.getElementById("jobOk").innerHTML = "";
       document.getElementById("btnDownload").disabled = true;
       document.getElementById("btnCancel").disabled = true;
+      document.getElementById("btnDelete").disabled = true;
       showMsg("Job deleted.", "ok");
       await refreshJobs();
-    }catch(e){
-      showMsg("Delete failed: " + e.message, "err");
-    }
-  };
+      setStatus("", "Idle", "Ready.");
+    }} catch(e) {{
+      showMsg("Delete failed: " + escapeHtml(e.message), "err");
+    }}
+  }};
 
-  document.getElementById("btnDownload").onclick = () => {
-    if(!selectedJobId) return;
+  document.getElementById("btnDownload").onclick = () => {{
+    if (!selectedJobId) return;
     window.location.href = "/api/jobs/" + selectedJobId + "/file";
-  };
+  }};
 
-  document.getElementById("btnCopyLog").onclick = async () => {
+  document.getElementById("btnCopyLog").onclick = async () => {{
     const t = document.getElementById("logBox").textContent;
     await navigator.clipboard.writeText(t);
     showMsg("Copied log to clipboard.", "ok");
-  };
+  }};
 
-  document.getElementById("btnDownloadLog").onclick = () => {
+  document.getElementById("btnDownloadLog").onclick = () => {{
     const t = document.getElementById("logBox").textContent;
-    const blob = new Blob([t], {type:"text/plain"});
+    const blob = new Blob([t], {{type:"text/plain"}});
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
     a.download = (selectedJobId ? selectedJobId : "log") + ".txt";
     a.click();
     URL.revokeObjectURL(a.href);
-  };
+  }};
 
-  document.getElementById("btnRefresh").onclick = refreshJobs;
+  document.getElementById("btnRefresh").onclick = async () => {{
+    try {{
+      await refreshJobs();
+      showMsg("Refreshed.", "ok");
+    }} catch(e) {{
+      showMsg("Refresh failed: " + escapeHtml(e.message), "err");
+    }}
+  }};
 
-  document.getElementById("btnClearLocal").onclick = () => {
-    // only clears token in this UI (server job list stays)
-    if(confirm("Clear saved token from this browser?")){
-      clearToken();
-      showMsg("Token cleared. Click Set Token to add it again.", "hint");
-    }
-  };
-
-  document.getElementById("logFilter").oninput = async () => {
-    if(selectedJobId){
+  document.getElementById("logFilter").oninput = async () => {{
+    if (!selectedJobId) return;
+    try {{
       const r = await api("/api/jobs/" + selectedJobId);
       updateDetail(await r.json());
-    }
-  };
+    }} catch(e) {{}}
+  }};
 
-  // ===== Keep alive + wake status =====
-  async function wake(){
-    try{
+  // ========= Health + System metrics =========
+  async function wakePing() {{
+    try {{
       const r = await fetch("/healthz");
-      if(!r.ok) throw new Error("healthz not ok");
+      if (!r.ok) throw new Error("healthz not ok");
       document.getElementById("wakeDot").className = "dot good";
       document.getElementById("wakeText").textContent = "Online";
-    }catch{
+    }} catch(_) {{
       document.getElementById("wakeDot").className = "dot warn";
       document.getElementById("wakeText").textContent = "Warming up…";
-    }
-  }
-  setInterval(wake, 60000);
-  wake();
+    }}
+  }}
 
-  // Initial
+  async function sysPing() {{
+    const dot = document.getElementById("sysDot");
+    const diskText = document.getElementById("diskText");
+    const queueText = document.getElementById("queueText");
+
+    try {{
+      const t = getToken();
+      if (!t) {{
+        dot.className = "dot warn";
+        diskText.textContent = "— (set token)";
+        queueText.textContent = "—";
+        return;
+      }}
+      const r = await api("/api/system");
+      const s = await r.json();
+
+      const free = s.disk_download_dir?.free_mb ?? 0;
+      const total = s.disk_download_dir?.total_mb ?? 0;
+      const qsz = s.queue?.size ?? 0;
+      const qmax = s.queue?.max ?? 0;
+
+      diskText.textContent = free + "MB / " + total + "MB";
+      queueText.textContent = qsz + " / " + qmax;
+
+      if (free < 500) dot.className = "dot bad";
+      else if (free < 900) dot.className = "dot warn";
+      else dot.className = "dot good";
+    }} catch(e) {{
+      dot.className = "dot warn";
+      diskText.textContent = "—";
+      queueText.textContent = "—";
+    }}
+  }}
+
+  // ========= Init =========
   updateTokenBadge();
-  refreshJobs();
   setStatus("", "Idle", "Ready.");
+  wakePing();
+  setInterval(wakePing, 60000);
+
+  sysPing();
+  setInterval(sysPing, 20000);
+
+  (async () => {{
+    try {{
+      if (getToken()) {{
+        await refreshJobs();
+      }}
+    }} catch(e) {{}}
+  }})();
 </script>
 </body>
 </html>
@@ -1002,13 +1410,10 @@ async def create_job(req: Request):
             raise HTTPException(400, "bandwidth must be a number (KiB/s)")
         bandwidth = clamp_int(bandwidth, 64, 20000)
 
-    # beginning/ending (FIX: don't stringify None)
     beginning = normalize_optional_time(body.get("beginning"))
     ending = normalize_optional_time(body.get("ending"))
-
     include_chat = bool(body.get("include_chat", True))
 
-    # chat settings
     def get_int(name, default, lo, hi):
         try:
             v = int(str(body.get(name, default)).strip())
@@ -1016,17 +1421,24 @@ async def create_job(req: Request):
             raise HTTPException(400, f"{name} must be a number")
         return clamp_int(v, lo, hi)
 
-    chat_width = get_int("chat_width", 422, 250, 900)
+    chat_width = get_int("chat_width", 420, 250, 900)
     font_size = get_int("font_size", 18, 10, 52)
-    framerate = get_int("framerate", 30, 10, 60)
+    framerate = get_int("framerate", 24, 10, 60)
+
     try:
-        update_rate = float(str(body.get("update_rate", 0.2)).strip())
+        update_rate = float(str(body.get("update_rate", 0.25)).strip())
     except Exception:
         raise HTTPException(400, "update_rate must be a number")
-    update_rate = max(0.0, min(2.0, update_rate))
+    update_rate = max(0.05, min(2.0, update_rate))
 
     background_color = normalize_color(str(body.get("background_color", "#111111")))
     outline = str(body.get("outline", "false")).strip().lower() == "true"
+
+    try:
+        crf = int(str(body.get("crf", "23")).strip())
+    except Exception:
+        raise HTTPException(400, "crf must be a number")
+    crf = clamp_int(crf, 18, 28)
 
     if q.full():
         raise HTTPException(429, "Queue full. Try again later.")
@@ -1046,6 +1458,7 @@ async def create_job(req: Request):
         "quality": quality,
         "include_chat": include_chat,
         "path": "",
+        "files": [video_path, chat_json, chat_mp4, final_path],
         "log": "",
         "last_log_line": "",
         "hint": "",
@@ -1065,17 +1478,20 @@ async def create_job(req: Request):
         "beginning": beginning,
         "ending": ending,
         "include_chat": include_chat,
+
         "video_path": video_path,
         "chat_json": chat_json,
         "chat_mp4": chat_mp4,
         "final_path": final_path,
+
         "chat_width": chat_width,
         "chat_height": 1080,
         "font_size": font_size,
         "framerate": framerate,
         "update_rate": update_rate,
         "background_color": background_color,
-        "outline": outline
+        "outline": outline,
+        "crf": crf,
     })
 
     return {"job_id": job_id}
@@ -1093,9 +1509,10 @@ def job_file(job_id: str, req: Request):
     job = get_job_or_404(job_id)
     if job.get("status") != "done":
         raise HTTPException(409, "not ready")
+
     path = job.get("path") or ""
     if not path or not os.path.exists(path):
-        raise HTTPException(410, "file expired or missing (Render Free /tmp is temporary)")
+        raise HTTPException(410, "file expired or missing (instance restarted / ephemeral storage)")
     return FileResponse(path, filename=os.path.basename(path))
 
 
@@ -1111,13 +1528,7 @@ def cancel_job(job_id: str, req: Request):
 def delete_job(job_id: str, req: Request):
     auth(req)
     job = get_job_or_404(job_id)
-    # remove any file
-    path = job.get("path") or ""
-    try:
-        if path and os.path.exists(path):
-            os.remove(path)
-    except Exception:
-        pass
+    cleanup_job_files(job)
     jobs.pop(job_id, None)
     if job_id in jobs_order:
         jobs_order.remove(job_id)
