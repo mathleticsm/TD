@@ -1,8 +1,32 @@
+# =========================
+# Builder: download TwitchDownloaderCLI once
+# =========================
+FROM python:3.12-slim AS td_builder
+
+ARG TD_VERSION=1.56.2
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN set -eux; \
+  apt-get update; \
+  apt-get install -y --no-install-recommends ca-certificates curl unzip; \
+  rm -rf /var/lib/apt/lists/*
+
+RUN set -eux; \
+  curl -fsSL -o /tmp/td.zip \
+    "https://github.com/lay295/TwitchDownloader/releases/download/${TD_VERSION}/TwitchDownloaderCLI-${TD_VERSION}-Linux-x64.zip"; \
+  unzip -j /tmp/td.zip "TwitchDownloaderCLI*" -d /out/; \
+  chmod +x /out/TwitchDownloaderCLI; \
+  rm -f /tmp/td.zip
+
+# =========================
+# Runtime
+# =========================
 FROM python:3.12-slim
 
 ARG TD_VERSION=1.56.2
+ENV DEBIAN_FRONTEND=noninteractive
 
-# Better defaults for containers
+# Better defaults for containers + Render Free temp workaround
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -14,36 +38,39 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     TMPDIR=/app/tdtmp
 
 # System deps:
-# - ffmpeg for combining videos
+# - ffmpeg for combine
 # - fontconfig + noto fonts for chat rendering
-# - libicu fixes TwitchDownloaderCLI (.NET) crash
-# - tini for clean shutdown / signal handling
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# - ICU runtime fixes TwitchDownloaderCLI (.NET) crash
+# - tini for clean shutdown
+RUN set -eux; \
+  apt-get update; \
+  apt-get install -y --no-install-recommends \
     ffmpeg \
     fontconfig libfontconfig1 \
     fonts-noto-core fonts-noto-color-emoji fonts-noto-cjk \
-    libicu-dev \
-    ca-certificates curl unzip \
-    tini \
-  && rm -rf /var/lib/apt/lists/*
+    ca-certificates \
+    tini; \
+  # ICU package name varies by Debian base; try common runtime packages, fallback to -dev as last resort
+  (apt-get install -y --no-install-recommends libicu72 \
+    || apt-get install -y --no-install-recommends libicu71 \
+    || apt-get install -y --no-install-recommends libicu70 \
+    || apt-get install -y --no-install-recommends libicu-dev); \
+  rm -rf /var/lib/apt/lists/*
 
-# Download TwitchDownloaderCLI
-RUN curl -fsSL -o /tmp/td.zip \
-      "https://github.com/lay295/TwitchDownloader/releases/download/${TD_VERSION}/TwitchDownloaderCLI-${TD_VERSION}-Linux-x64.zip" \
-  && unzip -j /tmp/td.zip "TwitchDownloaderCLI*" -d /usr/local/bin/ \
-  && chmod +x /usr/local/bin/TwitchDownloaderCLI \
-  && rm -f /tmp/td.zip
+# TwitchDownloaderCLI binary (from builder) - no curl/unzip in final image
+COPY --from=td_builder /out/TwitchDownloaderCLI /usr/local/bin/TwitchDownloaderCLI
 
-# Create non-root user + writable dirs
-RUN useradd -m -u 10001 appuser \
-  && mkdir -p /app /app/storage /app/tdtmp \
-  && chown -R appuser:appuser /app
+# Create non-root user + writable dirs (Render Free needs persistent writable paths)
+RUN set -eux; \
+  useradd -m -u 10001 appuser; \
+  mkdir -p /app /app/storage /app/tdtmp; \
+  chown -R appuser:appuser /app
 
 WORKDIR /app
 
-# Install python deps first for better caching
+# Install python deps first (better layer caching)
 COPY requirements.txt /app/requirements.txt
-RUN python -m pip install --upgrade pip \
+RUN python -m pip install --upgrade pip setuptools wheel \
   && pip install -r /app/requirements.txt
 
 # Copy app
@@ -51,17 +78,13 @@ COPY --chown=appuser:appuser app.py /app/app.py
 
 USER appuser
 
-# Render sets PORT
 EXPOSE 10000
 
-# Optional: container-level healthcheck (Render uses its own too, but this is helpful)
+# Optional healthcheck (Render has its own, but this helps debugging)
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/healthz' % (__import__('os').environ.get('PORT','10000'))).read()" || exit 1
+  CMD python -c "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/healthz' % os.environ.get('PORT','10000')).read()" || exit 1
 
-# tini helps prevent zombie processes + handles SIGTERM correctly
 ENTRYPOINT ["/usr/bin/tini", "--"]
 
-# uvicorn options:
-# --proxy-headers helps behind Render proxy
-# --forwarded-allow-ips="*" allows X-Forwarded-* headers
-CMD ["bash","-lc","uvicorn app:app --host 0.0.0.0 --port ${PORT:-10000} --proxy-headers --forwarded-allow-ips='*'"]
+# Keep 1 worker for Render Free (memory + CPU)
+CMD ["bash","-lc","uvicorn app:app --host 0.0.0.0 --port ${PORT:-10000} --workers 1 --proxy-headers --forwarded-allow-ips='*'"]
